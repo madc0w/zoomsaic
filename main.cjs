@@ -3,7 +3,7 @@ const path = require('path');
 const sharp = require('sharp');
 // const Jimp = require('jimp');
 
-const defaultTileSize = 64;
+const defaultTileSize = 40;
 const defaultMosaicWidth = 120;
 
 class MosaicGenerator {
@@ -320,34 +320,64 @@ class MosaicGenerator {
 			`Compositing final ${mosaicWidth} x ${finalMosaicHeight} mosaic...`
 		);
 
-		// Create composite operations for sharp
-		const compositeOps = [];
-		for (let y = 0; y < finalMosaicHeight; y++) {
-			console.log(`Row ${y + 1} of ${finalMosaicHeight}`);
-			for (let x = 0; x < mosaicWidth; x++) {
-				const tilePath = tileImages[y][x];
-				compositeOps.push({
-					input: await sharp(tilePath).resize(tileSize, tileSize).toBuffer(),
-					left: x * tileSize,
-					top: y * tileSize,
-				});
-			}
-		}
-
-		// Create final mosaic using sharp composite
+		// Create final mosaic more efficiently by processing row by row
 		const finalWidth = mosaicWidth * tileSize;
 		const finalHeight = finalMosaicHeight * tileSize;
 
 		const startTime = new Date();
-		await sharp({
-			create: {
+
+		// Create rows of tiles and then combine them
+		const rowBuffers = [];
+
+		for (let y = 0; y < finalMosaicHeight; y++) {
+			console.log(`Processing row ${y + 1} of ${finalMosaicHeight}`);
+
+			// Process all tiles in this row
+			const tileBuffers = [];
+			for (let x = 0; x < mosaicWidth; x++) {
+				const tilePath = tileImages[y][x];
+				const tileBuffer = await sharp(tilePath)
+					.resize(tileSize, tileSize)
+					.raw()
+					.toBuffer();
+				tileBuffers.push(tileBuffer);
+			}
+
+			// Combine tiles horizontally to create a row
+			const rowWidth = mosaicWidth * tileSize;
+			const rowHeight = tileSize;
+			const rowBuffer = Buffer.alloc(rowWidth * rowHeight * 3);
+
+			for (let x = 0; x < mosaicWidth; x++) {
+				const tileBuffer = tileBuffers[x];
+				for (let ty = 0; ty < tileSize; ty++) {
+					for (let tx = 0; tx < tileSize; tx++) {
+						const srcOffset = (ty * tileSize + tx) * 3;
+						const dstOffset = (ty * rowWidth + (x * tileSize + tx)) * 3;
+
+						rowBuffer[dstOffset] = tileBuffer[srcOffset]; // R
+						rowBuffer[dstOffset + 1] = tileBuffer[srcOffset + 1]; // G
+						rowBuffer[dstOffset + 2] = tileBuffer[srcOffset + 2]; // B
+					}
+				}
+			}
+
+			rowBuffers.push(rowBuffer);
+		}
+
+		console.log('Combining rows into final image...');
+
+		// Combine all rows vertically
+		const finalBuffer = Buffer.concat(rowBuffers);
+
+		// Save the final image
+		await sharp(finalBuffer, {
+			raw: {
 				width: finalWidth,
 				height: finalHeight,
 				channels: 3,
-				background: { r: 255, g: 255, b: 255 },
 			},
 		})
-			.composite(compositeOps)
 			.png()
 			.toFile(outputPath);
 
