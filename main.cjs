@@ -1,3 +1,16 @@
+// Usage:
+// # Infinite zoom sequence (runs forever)
+// node main.cjs photo.jpg ./tiles zoom_sequence.png --infinite-zoom
+
+// # Limited iterations
+// node main.cjs photo.jpg ./tiles zoom.png --infinite-zoom --max-iterations 10
+
+// # Custom zoom factor (20% zoom per iteration)
+// node main.cjs photo.jpg ./tiles zoom.png --infinite-zoom --zoom-factor 0.8
+
+// # Single mosaic (original behavior)
+// node main.cjs photo.jpg ./tiles output.png
+
 const fs = require('fs').promises;
 const path = require('path');
 const sharp = require('sharp');
@@ -5,6 +18,7 @@ const sharp = require('sharp');
 
 const defaultTileSize = 40;
 const defaultMosaicWidth = 120;
+const defaultZoomSteps = 4;
 
 class MosaicGenerator {
 	constructor() {
@@ -153,6 +167,126 @@ class MosaicGenerator {
 		}
 	}
 
+	// Zoom into center of image by specified percentage
+	async zoomImage(imagePath, zoomFactor = 0.9) {
+		const image = sharp(imagePath);
+		const metadata = await image.metadata();
+
+		const { width, height } = metadata;
+		const newWidth = Math.round(width * zoomFactor);
+		const newHeight = Math.round(height * zoomFactor);
+
+		// Calculate center crop coordinates
+		const left = Math.round((width - newWidth) / 2);
+		const top = Math.round((height - newHeight) / 2);
+
+		// Create a temporary file for the zoomed image
+		const tempPath = imagePath.replace(/(\.[^.]+)$/, '_zoomed$1');
+
+		await image
+			.extract({ left, top, width: newWidth, height: newHeight })
+			.resize(width, height) // Scale back to original dimensions
+			.toFile(tempPath);
+
+		return tempPath;
+	}
+
+	// Generate infinite zoom mosaic sequence
+	async generateInfiniteZoomMosaic(
+		inputImagePath,
+		tilesDirectory,
+		outputPath,
+		options = {}
+	) {
+		const {
+			zoomFactor = 0.9, // 10% zoom each iteration
+			maxIterations = null, // null for infinite
+			zoomSteps = defaultZoomSteps, // Number of zoom steps between mosaics
+			...mosaicOptions
+		} = options;
+
+		// Parse output path to get base name and extension
+		const parsedPath = path.parse(outputPath);
+		const baseOutputPath = path.join(parsedPath.dir, parsedPath.name);
+		const extension = parsedPath.ext;
+
+		let currentInputPath = inputImagePath;
+		let globalFrameNumber = 0;
+
+		try {
+			while (
+				maxIterations === null ||
+				globalFrameNumber / (zoomSteps + 1) < maxIterations
+			) {
+				const iterationNumber =
+					Math.floor(globalFrameNumber / (zoomSteps + 1)) + 1;
+				console.log(`\n=== ITERATION ${iterationNumber} ===`);
+
+				// Generate mosaic first
+				globalFrameNumber++;
+				const paddedFrameNumber = globalFrameNumber.toString().padStart(4, '0');
+				const mosaicOutputPath = `${baseOutputPath}_${paddedFrameNumber}${extension}`;
+
+				console.log(`Generating mosaic frame ${globalFrameNumber}...`);
+				await this.generateMosaic(
+					currentInputPath,
+					tilesDirectory,
+					mosaicOutputPath,
+					mosaicOptions
+				);
+
+				console.log(`Mosaic completed: ${mosaicOutputPath}`);
+
+				// Now generate the zoom sequence
+				let zoomInputPath = mosaicOutputPath;
+
+				for (let zoomStep = 1; zoomStep <= zoomSteps; zoomStep++) {
+					globalFrameNumber++;
+					const paddedZoomFrame = globalFrameNumber.toString().padStart(4, '0');
+					const zoomOutputPath = `${baseOutputPath}_${paddedZoomFrame}${extension}`;
+
+					console.log(
+						`Creating zoom step ${zoomStep}/${zoomSteps} (frame ${globalFrameNumber})...`
+					);
+
+					// Create zoomed version and save it directly
+					const image = sharp(zoomInputPath);
+					const metadata = await image.metadata();
+
+					const { width, height } = metadata;
+					const newWidth = Math.round(width * zoomFactor);
+					const newHeight = Math.round(height * zoomFactor);
+
+					// Calculate center crop coordinates
+					const left = Math.round((width - newWidth) / 2);
+					const top = Math.round((height - newHeight) / 2);
+
+					await image
+						.extract({ left, top, width: newWidth, height: newHeight })
+						.resize(width, height) // Scale back to original dimensions
+						.png()
+						.toFile(zoomOutputPath);
+
+					console.log(`Zoom step completed: ${zoomOutputPath}`);
+					zoomInputPath = zoomOutputPath;
+				}
+
+				// Set up for next iteration
+				currentInputPath = zoomInputPath;
+
+				// Optional: Add a small delay to prevent system overload
+				await new Promise((resolve) => setTimeout(resolve, 1000));
+			}
+		} catch (error) {
+			console.error(`Error during frame ${globalFrameNumber}:`, error.message);
+			throw error;
+		}
+
+		console.log(
+			`\nInfinite zoom mosaic completed ${globalFrameNumber} frames!`
+		);
+	}
+
 	// Generate the mosaic
 	async generateMosaic(
 		inputImagePath,
@@ -213,7 +347,11 @@ class MosaicGenerator {
 			const newTileFiles = tileFiles.filter((file) => !cachedPaths.has(file));
 
 			if (newTileFiles.length > 0) {
-				console.log(`Processing ${newTileFiles.length} new tile images...`);
+				console.log(
+					`${new Date().toISOString()} : Processing ${
+						newTileFiles.length
+					} new tile images...`
+				);
 				let processed = 0;
 
 				for (const tileFile of newTileFiles) {
@@ -330,7 +468,11 @@ class MosaicGenerator {
 		const rowBuffers = [];
 
 		for (let y = 0; y < finalMosaicHeight; y++) {
-			console.log(`Processing row ${y + 1} of ${finalMosaicHeight}`);
+			console.log(
+				`${new Date().toISOString()} : Processing row ${
+					y + 1
+				} of ${finalMosaicHeight}`
+			);
 
 			// Process all tiles in this row
 			const tileBuffers = [];
@@ -414,21 +556,40 @@ async function main() {
 		console.log('');
 		console.log('Options:');
 		console.log(
-			'  --width <number>     Number of tiles horizontally (default: 100)'
+			`  --width <number>      Number of tiles horizontally (default: ${defaultMosaicWidth})`
 		);
 		console.log(
-			'  --height <number>    Number of tiles vertically (auto if not specified)'
+			'  --height <number>     Number of tiles vertically (auto if not specified)'
 		);
 		console.log(
-			'  --tile-size <number> Size of each tile in pixels (default: 32)'
+			`  --tile-size <number>  Size of each tile in pixels (default: ${defaultTileSize})`
 		);
 		console.log(
-			"  --no-reuse          Don't reuse tiles (may result in lower quality)"
+			"  --no-reuse           Don't reuse tiles (may result in lower quality)"
+		);
+		console.log('  --infinite-zoom      Generate infinite zoom sequence');
+		console.log(
+			'  --zoom-factor <num>  Zoom factor per iteration (default: 0.9 = 10% zoom)'
+		);
+		console.log(
+			`  --zoom-steps <num>   Number of zoom steps between mosaics (default: ${defaultZoomSteps})`
+		);
+		console.log(
+			'  --max-iterations <n> Maximum iterations (default: infinite)'
 		);
 		console.log('');
-		console.log('Example:');
+		console.log('Examples:');
 		console.log(
 			'  node main.cjs photo.jpg ./tiles output.png --width 150 --tile-size 24'
+		);
+		console.log(
+			'  node main.cjs photo.jpg ./tiles zoom_sequence.png --infinite-zoom'
+		);
+		console.log(
+			'  node main.cjs photo.jpg ./tiles zoom.png --infinite-zoom --max-iterations 5'
+		);
+		console.log(
+			'  node main.cjs photo.jpg ./tiles zoom.png --infinite-zoom --zoom-steps 6'
 		);
 		process.exit(1);
 	}
@@ -441,6 +602,10 @@ async function main() {
 		mosaicHeight: null,
 		tileSize: defaultTileSize,
 		allowReuse: true,
+		infiniteZoom: false,
+		zoomFactor: 0.9,
+		zoomSteps: defaultZoomSteps,
+		maxIterations: null,
 	};
 
 	for (let i = 3; i < args.length; i++) {
@@ -457,6 +622,18 @@ async function main() {
 			case '--no-reuse':
 				options.allowReuse = false;
 				break;
+			case '--infinite-zoom':
+				options.infiniteZoom = true;
+				break;
+			case '--zoom-factor':
+				options.zoomFactor = parseFloat(args[++i]);
+				break;
+			case '--zoom-steps':
+				options.zoomSteps = parseInt(args[++i]);
+				break;
+			case '--max-iterations':
+				options.maxIterations = parseInt(args[++i]);
+				break;
 		}
 	}
 
@@ -466,14 +643,41 @@ async function main() {
 		await fs.access(tilesDirectory);
 
 		const generator = new MosaicGenerator();
-		const result = await generator.generateMosaic(
-			inputImage,
-			tilesDirectory,
-			outputImage,
-			options
-		);
 
-		console.log('\nMosaic generation completed successfully!');
+		if (options.infiniteZoom) {
+			// Generate infinite zoom sequence
+			console.log('Starting infinite zoom mosaic generation...');
+			console.log(
+				`Zoom factor: ${options.zoomFactor} (${Math.round(
+					(1 - options.zoomFactor) * 100
+				)}% zoom per iteration)`
+			);
+			if (options.maxIterations) {
+				console.log(`Maximum iterations: ${options.maxIterations}`);
+			} else {
+				console.log('Maximum iterations: infinite (press Ctrl+C to stop)');
+			}
+
+			await generator.generateInfiniteZoomMosaic(
+				inputImage,
+				tilesDirectory,
+				outputImage,
+				options
+			);
+
+			console.log('\nInfinite zoom mosaic sequence completed!');
+		} else {
+			// Generate single mosaic
+			const result = await generator.generateMosaic(
+				inputImage,
+				tilesDirectory,
+				outputImage,
+				options
+			);
+
+			console.log('\nMosaic generation completed successfully!');
+		}
+
 		console.log(`Input: ${inputImage}`);
 		console.log(`Output: ${outputImage}`);
 		console.log(`Tiles directory: ${tilesDirectory}`);
