@@ -1,0 +1,26 @@
+{
+	"name": "zoomsaic",
+	"version": "1.0.0",
+	"description": "A mosaic generator that creates image mosaics from tile collections",
+	"main": "main.cjs",
+	"scripts": {
+		"start": "node main.cjs",
+		"install-deps": "npm install"
+	},
+	"keywords": [
+		"mosaic",
+		"image",
+		"tiles",
+		"art",
+		"photography"
+	],
+	"author": "",
+	"license": "MIT",
+	"dependencies": {
+		"sharp": "^0.32.6",
+		"jimp": "^0.22.10"
+	},
+	"engines": {
+		"node": ">=14.0.0"
+	}
+}
