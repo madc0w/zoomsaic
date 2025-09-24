@@ -16,14 +16,15 @@ const path = require('path');
 const sharp = require('sharp');
 // const Jimp = require('jimp');
 
-const defaultTileSize = 40;
-const defaultMosaicWidth = 120;
-const defaultZoomSteps = 4;
+const defaultTileSize = 4;
+const defaultOutputWidth = 1200; // Default output image width in pixels
+const defaultZoomSteps = 8;
 
 class MosaicGenerator {
 	constructor() {
 		this.tileCache = new Map();
 		this.tileSize = defaultTileSize; // Size of each mosaic tile
+		this.corruptedTiles = new Set(); // Track corrupted tiles to avoid reusing them
 	}
 
 	// Get all image files from directory and subdirectories
@@ -60,43 +61,97 @@ class MosaicGenerator {
 
 	// Calculate average color of an image
 	async getAverageColor(imagePath) {
+		// Check if this tile is already known to be corrupted
+		if (this.corruptedTiles.has(imagePath)) {
+			return null;
+		}
+
 		if (this.tileCache.has(imagePath)) {
 			return this.tileCache.get(imagePath);
 		}
 
 		try {
-			// Resize image to tile size and get raw pixel data
-			const { data, info } = await sharp(imagePath)
-				.resize(this.tileSize, this.tileSize)
-				.raw()
-				.toBuffer({ resolveWithObject: true });
+			// Add timeout and retry logic for network files
+			const processImage = async (retryCount = 0) => {
+				try {
+					// Resize image to tile size and get raw pixel data
+					const { data, info } = await sharp(imagePath)
+						.resize(this.tileSize, this.tileSize)
+						.raw()
+						.toBuffer({ resolveWithObject: true });
 
-			let r = 0,
-				g = 0,
-				b = 0;
-			const pixelCount = data.length / 3;
+					let r = 0,
+						g = 0,
+						b = 0;
+					const pixelCount = data.length / 3;
 
-			// Calculate average RGB values
-			for (let i = 0; i < data.length; i += 3) {
-				r += data[i];
-				g += data[i + 1];
-				b += data[i + 2];
-			}
+					// Calculate average RGB values
+					for (let i = 0; i < data.length; i += 3) {
+						r += data[i];
+						g += data[i + 1];
+						b += data[i + 2];
+					}
 
-			const avgColor = {
-				r: Math.round(r / pixelCount),
-				g: Math.round(g / pixelCount),
-				b: Math.round(b / pixelCount),
-				path: imagePath,
+					const avgColor = {
+						r: Math.round(r / pixelCount),
+						g: Math.round(g / pixelCount),
+						b: Math.round(b / pixelCount),
+						path: imagePath,
+					};
+
+					this.tileCache.set(imagePath, avgColor);
+					return avgColor;
+				} catch (error) {
+					if (
+						retryCount < 2 &&
+						(error.message.includes('Premature end') ||
+							error.message.includes('truncated'))
+					) {
+						console.warn(
+							`Retrying corrupted file (attempt ${
+								retryCount + 2
+							}/3): ${imagePath}`
+						);
+						await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait 1 second before retry
+						return processImage(retryCount + 1);
+					}
+					throw error;
+				}
 			};
 
-			this.tileCache.set(imagePath, avgColor);
-			return avgColor;
+			return await processImage();
 		} catch (error) {
 			console.warn(
 				`Warning: Could not process image ${imagePath}: ${error.message}`
 			);
+			// Mark this tile as corrupted during initial processing
+			this.corruptedTiles.add(imagePath);
+			console.warn(
+				`Added ${imagePath} to corrupted tiles blacklist during preprocessing`
+			);
 			return null;
+		}
+	}
+
+	// Validate a tile with retries for network resilience
+	async validateTileWithRetry(imagePath, maxRetries = 3) {
+		for (let attempt = 1; attempt <= maxRetries; attempt++) {
+			try {
+				await sharp(imagePath)
+					.resize(this.tileSize, this.tileSize)
+					.raw()
+					.toBuffer();
+				return; // Success
+			} catch (error) {
+				if (attempt === maxRetries) {
+					throw error; // Final attempt failed
+				}
+				console.warn(
+					`Validation attempt ${attempt}/${maxRetries} failed for ${imagePath}, retrying...`
+				);
+				// Wait before retry (exponential backoff)
+				await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+			}
 		}
 	}
 
@@ -110,14 +165,24 @@ class MosaicGenerator {
 
 	// Find the best matching tile for a given color
 	findBestTile(targetColor, tiles) {
-		let bestTile = tiles[0];
+		// Filter out corrupted tiles upfront
+		const validTiles = tiles.filter(
+			(tile) => !this.corruptedTiles.has(tile.path)
+		);
+
+		// If no valid tiles remain, throw an error
+		if (validTiles.length === 0) {
+			throw new Error('No valid tiles available - all tiles are corrupted');
+		}
+
+		let bestTile = validTiles[0];
 		let bestDistance = this.colorDistanceSq(targetColor, bestTile);
 
-		for (let i = 1; i < tiles.length; i++) {
-			const distance = this.colorDistanceSq(targetColor, tiles[i]);
+		for (let i = 1; i < validTiles.length; i++) {
+			const distance = this.colorDistanceSq(targetColor, validTiles[i]);
 			if (distance < bestDistance) {
 				bestDistance = distance;
-				bestTile = tiles[i];
+				bestTile = validTiles[i];
 			}
 		}
 
@@ -295,11 +360,18 @@ class MosaicGenerator {
 		options = {}
 	) {
 		const {
-			mosaicWidth = defaultMosaicWidth, // Number of tiles horizontally
+			outputWidth = defaultOutputWidth, // Target output image width in pixels
+			outputHeight = null, // Target output image height in pixels (auto if null)
+			mosaicWidth = null, // Number of tiles horizontally (computed if null)
 			mosaicHeight = null, // Number of tiles vertically (auto if null)
 			tileSize = defaultTileSize, // Size of each tile in pixels
 			allowReuse = true, // Allow tiles to be reused
 		} = options;
+
+		// Compute mosaic dimensions based on output resolution
+		const computedMosaicWidth =
+			mosaicWidth || Math.round(outputWidth / tileSize);
+		const finalMosaicWidth = computedMosaicWidth;
 
 		this.tileSize = tileSize;
 
@@ -314,6 +386,20 @@ class MosaicGenerator {
 
 		if (tiles) {
 			console.log(`Loaded ${tiles.length} tiles from cache`);
+
+			// Just blacklist known problematic files without validation
+			const knownCorruptedFiles = [
+				'\\TINYTIM\\Quaffle\\Multimedia\\Misc\\European art\\W\\WILLIAM-ADOLPHE Bouguereau\\WILLIAM-ADOLPHE Bouguereau - Madonna-Roses.jpg',
+			];
+
+			// Add known corrupted files to blacklist
+			knownCorruptedFiles.forEach((path) => {
+				this.corruptedTiles.add(path);
+			});
+			console.log(
+				`Blacklisted ${knownCorruptedFiles.length} known problematic tiles`
+			);
+
 			// Get tile files from cache instead of scanning directory
 			tileFiles = tiles.map((tile) => tile.path);
 			// console.log('Checking for new tile images...');
@@ -361,8 +447,8 @@ class MosaicGenerator {
 					}
 					processed++;
 					if (processed % 50 === 0) {
-						console.log(
-							`Processed ${processed}/${newTileFiles.length} new tiles`
+						process.stdout.write(
+							`\rProcessed ${processed}/${newTileFiles.length} new tiles`
 						);
 					}
 				}
@@ -392,25 +478,37 @@ class MosaicGenerator {
 			await this.saveTileCacheToCSV(tiles, cacheFilePath);
 		}
 
+		// Filter out null entries (corrupted tiles)
+		tiles = tiles.filter((tile) => tile !== null);
+
 		if (tiles.length === 0) {
 			throw new Error('No valid tile images could be processed');
 		}
 
 		console.log(`Processed ${tiles.length} valid tiles`);
+		if (this.corruptedTiles.size > 0) {
+			console.log(
+				`Excluded ${this.corruptedTiles.size} corrupted tiles from selection`
+			);
+		}
 
 		// Calculate mosaic dimensions
 		const aspectRatio = inputMetadata.height / inputMetadata.width;
-		const finalMosaicHeight =
-			mosaicHeight || Math.round(mosaicWidth * aspectRatio);
+		const computedMosaicHeight = outputHeight
+			? Math.round(outputHeight / tileSize)
+			: Math.round(finalMosaicWidth * aspectRatio);
+		const finalMosaicHeight = mosaicHeight || computedMosaicHeight;
 
 		// Resize input image to mosaic grid size for color analysis
 		console.log('Analyzing input image colors...');
 		const { data: inputData } = await sharp(inputImagePath)
-			.resize(mosaicWidth, finalMosaicHeight)
+			.resize(finalMosaicWidth, finalMosaicHeight)
 			.raw()
 			.toBuffer({ resolveWithObject: true });
 
-		console.log(`Generating ${mosaicWidth}x${finalMosaicHeight} mosaic...`);
+		console.log(
+			`Generating ${finalMosaicWidth}x${finalMosaicHeight} mosaic...`
+		);
 
 		const usedTiles = new Set();
 		const tileImages = [];
@@ -418,9 +516,9 @@ class MosaicGenerator {
 		// Generate mosaic tile by tile
 		for (let y = 0; y < finalMosaicHeight; y++) {
 			const row = [];
-			for (let x = 0; x < mosaicWidth; x++) {
+			for (let x = 0; x < finalMosaicWidth; x++) {
 				// Get color of this pixel in the scaled input image
-				const pixelIndex = (y * mosaicWidth + x) * 3;
+				const pixelIndex = (y * finalMosaicWidth + x) * 3;
 				const targetColor = {
 					r: inputData[pixelIndex],
 					g: inputData[pixelIndex + 1],
@@ -446,20 +544,24 @@ class MosaicGenerator {
 			}
 			tileImages.push(row);
 
-			// Progress indicator
+			// Progress indicator - overwrite same line
 			if ((y + 1) % 10 === 0 || y === finalMosaicHeight - 1) {
-				console.log(
-					`Progress: ${Math.round(((y + 1) / finalMosaicHeight) * 100)}%`
-				);
+				const progress = Math.round(((y + 1) / finalMosaicHeight) * 100);
+				process.stdout.write(`\rProgress: ${progress}%`);
+
+				// Add newline only when complete
+				if (y === finalMosaicHeight - 1) {
+					process.stdout.write('\n');
+				}
 			}
 		}
 
 		console.log(
-			`Compositing final ${mosaicWidth} x ${finalMosaicHeight} mosaic...`
+			`Compositing final ${finalMosaicWidth} x ${finalMosaicHeight} mosaic...`
 		);
 
 		// Create final mosaic more efficiently by processing row by row
-		const finalWidth = mosaicWidth * tileSize;
+		const finalWidth = finalMosaicWidth * tileSize;
 		const finalHeight = finalMosaicHeight * tileSize;
 
 		const startTime = new Date();
@@ -476,21 +578,64 @@ class MosaicGenerator {
 
 			// Process all tiles in this row
 			const tileBuffers = [];
-			for (let x = 0; x < mosaicWidth; x++) {
+			for (let x = 0; x < finalMosaicWidth; x++) {
 				const tilePath = tileImages[y][x];
-				const tileBuffer = await sharp(tilePath)
-					.resize(tileSize, tileSize)
-					.raw()
-					.toBuffer();
-				tileBuffers.push(tileBuffer);
+				try {
+					const tileBuffer = await sharp(tilePath)
+						.resize(tileSize, tileSize)
+						.raw()
+						.toBuffer();
+					tileBuffers.push(tileBuffer);
+				} catch (error) {
+					console.warn(
+						`Tile failed during compositing at row ${y + 1}, column ${
+							x + 1
+						}: ${tilePath}`
+					);
+					console.warn(`Error details: ${error.message}`);
+
+					// Mark this tile as corrupted for future avoidance
+					this.corruptedTiles.add(tilePath);
+
+					// Find a replacement tile on the fly
+					const pixelIndex = (y * finalMosaicWidth + x) * 3;
+					const targetColor = {
+						r: inputData[pixelIndex],
+						g: inputData[pixelIndex + 1],
+						b: inputData[pixelIndex + 2],
+					};
+
+					// Get available tiles excluding corrupted ones
+					const availableTiles = tiles.filter(
+						(tile) => !this.corruptedTiles.has(tile.path)
+					);
+					if (availableTiles.length === 0) {
+						throw new Error(
+							'No valid tiles remaining after filtering corrupted tiles'
+						);
+					}
+
+					const replacementTile = this.findBestTile(
+						targetColor,
+						availableTiles
+					);
+					console.warn(`Using replacement tile: ${replacementTile.path}`);
+
+					// Process the replacement tile
+					const tileBuffer = await sharp(replacementTile.path)
+						.resize(tileSize, tileSize)
+						.raw()
+						.toBuffer();
+					tileBuffers.push(tileBuffer);
+				}
 			}
 
 			// Combine tiles horizontally to create a row
-			const rowWidth = mosaicWidth * tileSize;
+			const rowWidth = finalMosaicWidth * tileSize;
 			const rowHeight = tileSize;
 			const rowBuffer = Buffer.alloc(rowWidth * rowHeight * 3);
 
-			for (let x = 0; x < mosaicWidth; x++) {
+			for (let x = 0; x < finalMosaicWidth; x++) {
 				const tileBuffer = tileBuffers[x];
 				for (let ty = 0; ty < tileSize; ty++) {
 					for (let tx = 0; tx < tileSize; tx++) {
@@ -531,16 +676,23 @@ class MosaicGenerator {
 		);
 		console.log(`Final size: ${finalWidth}x${finalHeight} pixels`);
 		console.log(
-			`Tiles used: ${mosaicWidth}x${finalMosaicHeight} = ${
-				mosaicWidth * finalMosaicHeight
+			`Tiles used: ${finalMosaicWidth}x${finalMosaicHeight} = ${
+				finalMosaicWidth * finalMosaicHeight
 			} total`
 		);
+
+		if (this.corruptedTiles.size > 0) {
+			console.log(
+				`Corrupted tiles found and excluded: ${this.corruptedTiles.size}`
+			);
+		}
 
 		return {
 			width: finalWidth,
 			height: finalHeight,
-			tilesUsed: mosaicWidth * finalMosaicHeight,
+			tilesUsed: finalMosaicWidth * finalMosaicHeight,
 			availableTiles: tiles.length,
+			corruptedTiles: this.corruptedTiles.size,
 		};
 	}
 }
@@ -556,13 +708,19 @@ async function main() {
 		console.log('');
 		console.log('Options:');
 		console.log(
-			`  --width <number>      Number of tiles horizontally (default: ${defaultMosaicWidth})`
+			`  --output-width <number>   Target output image width in pixels (default: ${defaultOutputWidth})`
 		);
 		console.log(
-			'  --height <number>     Number of tiles vertically (auto if not specified)'
+			'  --output-height <number>  Target output image height in pixels (auto if not specified)'
 		);
 		console.log(
-			`  --tile-size <number>  Size of each tile in pixels (default: ${defaultTileSize})`
+			'  --tile-width <number>     Number of tiles horizontally (overrides output-width)'
+		);
+		console.log(
+			'  --tile-height <number>    Number of tiles vertically (auto if not specified)'
+		);
+		console.log(
+			`  --tile-size <number>      Size of each tile in pixels (default: ${defaultTileSize})`
 		);
 		console.log(
 			"  --no-reuse           Don't reuse tiles (may result in lower quality)"
@@ -580,7 +738,10 @@ async function main() {
 		console.log('');
 		console.log('Examples:');
 		console.log(
-			'  node main.cjs photo.jpg ./tiles output.png --width 150 --tile-size 24'
+			'  node main.cjs photo.jpg ./tiles output.png --output-width 6000 --tile-size 24'
+		);
+		console.log(
+			'  node main.cjs photo.jpg ./tiles output.png --tile-width 150 --tile-size 24'
 		);
 		console.log(
 			'  node main.cjs photo.jpg ./tiles zoom_sequence.png --infinite-zoom'
@@ -598,7 +759,9 @@ async function main() {
 
 	// Parse options
 	const options = {
-		mosaicWidth: defaultMosaicWidth,
+		outputWidth: defaultOutputWidth,
+		outputHeight: null,
+		mosaicWidth: null, // Number of tiles (overrides outputWidth)
 		mosaicHeight: null,
 		tileSize: defaultTileSize,
 		allowReuse: true,
@@ -610,10 +773,22 @@ async function main() {
 
 	for (let i = 3; i < args.length; i++) {
 		switch (args[i]) {
-			case '--width':
+			case '--output-width':
+				options.outputWidth = parseInt(args[++i]);
+				break;
+			case '--output-height':
+				options.outputHeight = parseInt(args[++i]);
+				break;
+			case '--tile-width':
 				options.mosaicWidth = parseInt(args[++i]);
 				break;
-			case '--height':
+			case '--tile-height':
+				options.mosaicHeight = parseInt(args[++i]);
+				break;
+			case '--width': // Legacy support
+				options.mosaicWidth = parseInt(args[++i]);
+				break;
+			case '--height': // Legacy support
 				options.mosaicHeight = parseInt(args[++i]);
 				break;
 			case '--tile-size':
