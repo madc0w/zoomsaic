@@ -16,7 +16,7 @@ const path = require('path');
 const sharp = require('sharp');
 // const Jimp = require('jimp');
 
-const defaultTileSize = 4;
+const defaultTileSize = 6;
 const defaultOutputWidth = 1200; // Default output image width in pixels
 const defaultZoomSteps = 8;
 
@@ -287,13 +287,13 @@ class MosaicGenerator {
 					Math.floor(globalFrameNumber / (zoomSteps + 1)) + 1;
 				console.log(`\n=== ITERATION ${iterationNumber} ===`);
 
-				// Generate mosaic first
+				// Generate mosaic first and capture tile pattern
 				globalFrameNumber++;
 				const paddedFrameNumber = globalFrameNumber.toString().padStart(4, '0');
 				const mosaicOutputPath = `${baseOutputPath}_${paddedFrameNumber}${extension}`;
 
-				console.log(`Generating mosaic frame ${globalFrameNumber}...`);
-				await this.generateMosaic(
+				console.log(`Generating initial mosaic frame ${globalFrameNumber}...`);
+				const mosaicResult = await this.generateMosaicWithTilePattern(
 					currentInputPath,
 					tilesDirectory,
 					mosaicOutputPath,
@@ -302,42 +302,50 @@ class MosaicGenerator {
 
 				console.log(`Mosaic completed: ${mosaicOutputPath}`);
 
-				// Now generate the zoom sequence
-				let zoomInputPath = mosaicOutputPath;
-
+				// Now generate zoom sequence by reusing tile pattern with larger tile sizes
 				for (let zoomStep = 1; zoomStep <= zoomSteps; zoomStep++) {
 					globalFrameNumber++;
 					const paddedZoomFrame = globalFrameNumber.toString().padStart(4, '0');
 					const zoomOutputPath = `${baseOutputPath}_${paddedZoomFrame}${extension}`;
 
 					console.log(
-						`Creating zoom step ${zoomStep}/${zoomSteps} (frame ${globalFrameNumber})...`
+						`Creating zoomed mosaic ${zoomStep}/${zoomSteps} (frame ${globalFrameNumber})...`
 					);
 
-					// Create zoomed version and save it directly
-					const image = sharp(zoomInputPath);
-					const metadata = await image.metadata();
+					// Calculate new tile size (tiles get LARGER with each zoom step)
+					// If zoomFactor = 0.9, then tiles grow by 1/0.9 = 1.111x each step
+					const baseTileSize = mosaicOptions.tileSize || defaultTileSize;
+					const zoomMultiplier = Math.pow(1 / zoomFactor, zoomStep);
+					const zoomTileSize = Math.round(baseTileSize * zoomMultiplier);
 
-					const { width, height } = metadata;
-					const newWidth = Math.round(width * zoomFactor);
-					const newHeight = Math.round(height * zoomFactor);
+					console.log(
+						`Tile size: ${baseTileSize} -> ${zoomTileSize} pixels (zoom factor: ${(
+							zoomTileSize / baseTileSize
+						).toFixed(2)}x)`
+					);
 
-					// Calculate center crop coordinates
-					const left = Math.round((width - newWidth) / 2);
-					const top = Math.round((height - newHeight) / 2);
+					// Get target output dimensions (same as original)
+					const targetWidth = mosaicResult.width;
+					const targetHeight = mosaicResult.height;
 
-					await image
-						.extract({ left, top, width: newWidth, height: newHeight })
-						.resize(width, height) // Scale back to original dimensions
-						.png()
-						.toFile(zoomOutputPath);
+					// Generate zoomed mosaic using same tile pattern but larger tiles
+					await this.generateZoomedMosaicFromPattern(
+						mosaicResult.tilePattern,
+						mosaicResult.mosaicWidth,
+						mosaicResult.mosaicHeight,
+						zoomTileSize,
+						targetWidth,
+						targetHeight,
+						zoomOutputPath
+					);
 
-					console.log(`Zoom step completed: ${zoomOutputPath}`);
-					zoomInputPath = zoomOutputPath;
+					console.log(`Zoomed mosaic completed: ${zoomOutputPath}`);
 				}
 
-				// Set up for next iteration
-				currentInputPath = zoomInputPath;
+				// Set up for next iteration - use the last zoomed frame
+				currentInputPath = `${baseOutputPath}_${globalFrameNumber
+					.toString()
+					.padStart(4, '0')}${extension}`;
 
 				// Optional: Add a small delay to prevent system overload
 				await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -349,6 +357,139 @@ class MosaicGenerator {
 
 		console.log(
 			`\nInfinite zoom mosaic completed ${globalFrameNumber} frames!`
+		);
+	}
+
+	// Generate mosaic and return tile pattern for zoom reuse
+	async generateMosaicWithTilePattern(
+		inputImagePath,
+		tilesDirectory,
+		outputPath,
+		options = {}
+	) {
+		const result = await this.generateMosaic(
+			inputImagePath,
+			tilesDirectory,
+			outputPath,
+			options
+		);
+		return {
+			...result,
+			tilePattern: this.lastTilePattern,
+			mosaicWidth: this.lastMosaicWidth,
+			mosaicHeight: this.lastMosaicHeight,
+		};
+	}
+
+	// Generate zoomed mosaic from existing tile pattern with larger tile size
+	async generateZoomedMosaicFromPattern(
+		tilePattern,
+		mosaicWidth,
+		mosaicHeight,
+		newTileSize,
+		targetWidth,
+		targetHeight,
+		outputPath
+	) {
+		console.log(
+			`Compositing ${mosaicWidth}x${mosaicHeight} mosaic with ${newTileSize}px tiles...`
+		);
+
+		// Calculate full mosaic dimensions with larger tiles
+		const fullWidth = mosaicWidth * newTileSize;
+		const fullHeight = mosaicHeight * newTileSize;
+		const startTime = new Date();
+
+		console.log(
+			`Full mosaic: ${fullWidth}x${fullHeight}, target: ${targetWidth}x${targetHeight}`
+		);
+
+		// Create rows of tiles using the existing pattern
+		const rowBuffers = [];
+
+		for (let y = 0; y < mosaicHeight; y++) {
+			console.log(`Processing row ${y + 1} of ${mosaicHeight}`);
+
+			// Process all tiles in this row
+			const tileBuffers = [];
+			for (let x = 0; x < mosaicWidth; x++) {
+				const tilePath = tilePattern[y][x];
+				try {
+					const tileBuffer = await sharp(tilePath)
+						.resize(newTileSize, newTileSize)
+						.raw()
+						.toBuffer();
+					tileBuffers.push(tileBuffer);
+				} catch (error) {
+					console.warn(`Failed to load tile ${tilePath}, using solid gray`);
+					// Create a solid gray fallback tile
+					const fallbackBuffer = Buffer.alloc(
+						newTileSize * newTileSize * 3,
+						128
+					);
+					tileBuffers.push(fallbackBuffer);
+				}
+			}
+
+			// Combine tiles horizontally to create a row
+			const rowWidth = mosaicWidth * newTileSize;
+			const rowHeight = newTileSize;
+			const rowBuffer = Buffer.alloc(rowWidth * rowHeight * 3);
+
+			for (let x = 0; x < mosaicWidth; x++) {
+				const tileBuffer = tileBuffers[x];
+				for (let ty = 0; ty < newTileSize; ty++) {
+					for (let tx = 0; tx < newTileSize; tx++) {
+						const srcOffset = (ty * newTileSize + tx) * 3;
+						const dstOffset = (ty * rowWidth + (x * newTileSize + tx)) * 3;
+
+						rowBuffer[dstOffset] = tileBuffer[srcOffset]; // R
+						rowBuffer[dstOffset + 1] = tileBuffer[srcOffset + 1]; // G
+						rowBuffer[dstOffset + 2] = tileBuffer[srcOffset + 2]; // B
+					}
+				}
+			}
+
+			rowBuffers.push(rowBuffer);
+		}
+
+		// Combine all rows vertically
+		const finalBuffer = Buffer.concat(rowBuffers);
+
+		// Create sharp instance from the full mosaic buffer
+		let image = sharp(finalBuffer, {
+			raw: {
+				width: fullWidth,
+				height: fullHeight,
+				channels: 3,
+			},
+		});
+
+		// Crop to target dimensions (center crop)
+		if (fullWidth > targetWidth || fullHeight > targetHeight) {
+			const left = Math.round((fullWidth - targetWidth) / 2);
+			const top = Math.round((fullHeight - targetHeight) / 2);
+
+			console.log(
+				`Cropping: ${fullWidth}x${fullHeight} -> ${targetWidth}x${targetHeight} (offset: ${left},${top})`
+			);
+
+			image = image.extract({
+				left: Math.max(0, left),
+				top: Math.max(0, top),
+				width: Math.min(targetWidth, fullWidth),
+				height: Math.min(targetHeight, fullHeight),
+			});
+		}
+
+		// Save the final image
+		await image.png().toFile(outputPath);
+
+		console.log(
+			`Zoomed mosaic saved: ${outputPath} (${targetWidth}x${targetHeight}) in ${(
+				(new Date() - startTime) /
+				1000
+			).toFixed(0)} secs`
 		);
 	}
 
@@ -555,6 +696,11 @@ class MosaicGenerator {
 				}
 			}
 		}
+
+		// Store tile pattern for zoom operations
+		this.lastTilePattern = tileImages;
+		this.lastMosaicWidth = finalMosaicWidth;
+		this.lastMosaicHeight = finalMosaicHeight;
 
 		console.log(
 			`Compositing final ${finalMosaicWidth} x ${finalMosaicHeight} mosaic...`
