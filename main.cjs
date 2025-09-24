@@ -408,7 +408,11 @@ class MosaicGenerator {
 		const rowBuffers = [];
 
 		for (let y = 0; y < mosaicHeight; y++) {
-			console.log(`Processing row ${y + 1} of ${mosaicHeight}`);
+			console.log(
+				`${new Date().toISOString()} : Processing row ${
+					y + 1
+				} of ${mosaicHeight}`
+			);
 
 			// Process all tiles in this row
 			const tileBuffers = [];
