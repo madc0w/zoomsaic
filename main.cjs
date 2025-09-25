@@ -16,9 +16,9 @@ const path = require('path');
 const sharp = require('sharp');
 // const Jimp = require('jimp');
 
-const defaultTileSize = 6;
+const defaultTileSize = 8;
 const defaultOutputWidth = 1200; // Default output image width in pixels
-const defaultZoomSteps = 8;
+const defaultZoomSteps = 20;
 
 class MosaicGenerator {
 	constructor() {
@@ -302,6 +302,7 @@ class MosaicGenerator {
 
 				console.log(`Mosaic completed: ${mosaicOutputPath}`);
 
+				let prevZoomTileSize;
 				// Now generate zoom sequence by reusing tile pattern with larger tile sizes
 				for (let zoomStep = 1; zoomStep <= zoomSteps; zoomStep++) {
 					globalFrameNumber++;
@@ -309,17 +310,23 @@ class MosaicGenerator {
 					const zoomOutputPath = `${baseOutputPath}_${paddedZoomFrame}${extension}`;
 
 					console.log(
-						`Creating zoomed mosaic ${zoomStep}/${zoomSteps} (frame ${globalFrameNumber})...`
+						`Creating zoomed mosaic ${zoomStep}/${zoomSteps} (frame ${globalFrameNumber}, zoom step ${zoomStep})...`
 					);
 
-					// Calculate new tile size (tiles get LARGER with each zoom step)
-					// If zoomFactor = 0.9, then tiles grow by 1/0.9 = 1.111x each step
+					// Calculate new tile size using zoom step within this iteration
+					// Reset zoom progression for each iteration to maintain smooth transitions
 					const baseTileSize = mosaicOptions.tileSize || defaultTileSize;
 					const zoomMultiplier = Math.pow(1 / zoomFactor, zoomStep);
 					const zoomTileSize = Math.round(baseTileSize * zoomMultiplier);
-
+					if (prevZoomTileSize == zoomTileSize) {
+						console.log(
+							`Tile size ${zoomTileSize} pixels same as previous step, skipping redundant frame`
+						);
+						continue;
+					}
+					prevZoomTileSize = zoomTileSize;
 					console.log(
-						`Tile size: ${baseTileSize} -> ${zoomTileSize} pixels (zoom factor: ${(
+						`Tile size: ${baseTileSize} -> ${zoomTileSize} pixels (continuous zoom factor: ${(
 							zoomTileSize / baseTileSize
 						).toFixed(2)}x)`
 					);
