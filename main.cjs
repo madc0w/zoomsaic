@@ -17,19 +17,22 @@ const sharp = require('sharp');
 // const Jimp = require('jimp');
 
 const defaultTileSize = 8;
-const defaultOutputWidth = 1200; // Default output image width in pixels
-const defaultZoomSteps = 20;
+const defaultOutputWidth = 1024; // Default output image width in pixels
+const defaultZoomSteps = 24;
+const defaultZoomFactor = 0.88;
+
+const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
 
 class MosaicGenerator {
 	constructor() {
 		this.tileCache = new Map();
 		this.tileSize = defaultTileSize; // Size of each mosaic tile
 		this.corruptedTiles = new Set(); // Track corrupted tiles to avoid reusing them
+		this.tileBufferCache = new Map(); // Map<tilePath_size, Buffer>
 	}
 
 	// Get all image files from directory and subdirectories
 	async getImageFiles(dir) {
-		const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
 		const files = [];
 
 		async function scanDirectory(currentDir) {
@@ -38,14 +41,22 @@ class MosaicGenerator {
 
 				for (const item of items) {
 					const fullPath = path.join(currentDir, item);
-					const stat = await fs.stat(fullPath);
 
-					if (stat.isDirectory()) {
-						await scanDirectory(fullPath);
-					} else if (
-						imageExtensions.includes(path.extname(item).toLowerCase())
-					) {
-						files.push(fullPath);
+					try {
+						const stat = await fs.stat(fullPath);
+						if (stat.isDirectory()) {
+							await scanDirectory(fullPath);
+						} else if (stat.isFile() && isImage(item)) {
+							// Additional validation: check if file is accessible
+							try {
+								await fs.access(fullPath, fs.constants.R_OK);
+								files.push(fullPath);
+							} catch (accessError) {
+								console.warn(`Skipping inaccessible file: ${fullPath}`);
+							}
+						}
+					} catch (statError) {
+						console.warn(`Could not stat ${fullPath}: ${statError.message}`);
 					}
 				}
 			} catch (error) {
@@ -163,6 +174,94 @@ class MosaicGenerator {
 		return dr * dr + dg * dg + db * db;
 	}
 
+	// Pre-load and cache tile buffers at specific size
+	async preloadTileBuffers(tiles, tileSize) {
+		console.log(`Pre-loading ${tiles.length} tiles at ${tileSize}px...`);
+		const cacheKey = `_${tileSize}`;
+
+		// Check if we already have tiles cached for this size
+		const cachedCount = tiles.filter((tile) =>
+			this.tileBufferCache.has(tile.path + cacheKey)
+		).length;
+
+		if (cachedCount === tiles.length) {
+			console.log(`All tiles already cached at ${tileSize}px`);
+			return;
+		}
+
+		// Process tiles in parallel batches
+		const BATCH_SIZE = 20; // Process 20 tiles at once
+		const batches = [];
+		for (let i = 0; i < tiles.length; i += BATCH_SIZE) {
+			batches.push(tiles.slice(i, i + BATCH_SIZE));
+		}
+
+		let processed = 0;
+		for (const batch of batches) {
+			const promises = batch.map(async (tile) => {
+				const bufferCacheKey = tile.path + cacheKey;
+				if (!this.tileBufferCache.has(bufferCacheKey)) {
+					// Skip if already known to be corrupted
+					if (this.corruptedTiles.has(tile.path)) {
+						processed++;
+						return;
+					}
+
+					// Validate file path and extension
+					if (!isImage(tile.path)) {
+						console.warn(
+							`Skipping invalid file (no image extension): ${tile.path}`
+						);
+						this.corruptedTiles.add(tile.path);
+						processed++;
+						return;
+					}
+
+					try {
+						// Check if file exists and is accessible
+						const stat = await fs.stat(tile.path);
+						if (!stat.isFile()) {
+							console.warn(`Skipping non-file: ${tile.path}`);
+							this.corruptedTiles.add(tile.path);
+							processed++;
+							return;
+						}
+
+						const buffer = await sharp(tile.path)
+							.resize(tileSize, tileSize)
+							.raw()
+							.toBuffer();
+						this.tileBufferCache.set(bufferCacheKey, buffer);
+					} catch (error) {
+						if (error.code === 'ENOENT') {
+							console.warn(`File not found: ${tile.path}`);
+						} else if (error.code === 'EACCES') {
+							console.warn(`Access denied: ${tile.path}`);
+						} else {
+							console.warn(
+								`Failed to preload tile: ${tile.path} - ${error.message}`
+							);
+						}
+						this.corruptedTiles.add(tile.path);
+					}
+				}
+				processed++;
+			});
+
+			await Promise.all(promises);
+			if (processed % 100 === 0 || processed === tiles.length) {
+				process.stdout.write(`\rPreloaded ${processed}/${tiles.length} tiles`);
+			}
+		}
+		console.log(''); // New line
+	}
+
+	// Get cached tile buffer
+	getCachedTileBuffer(tilePath, tileSize) {
+		const cacheKey = tilePath + `_${tileSize}`;
+		return this.tileBufferCache.get(cacheKey);
+	}
+
 	// Find the best matching tile for a given color
 	findBestTile(targetColor, tiles) {
 		// Filter out corrupted tiles upfront
@@ -198,21 +297,26 @@ class MosaicGenerator {
 
 			// Skip header line
 			for (let i = 1; i < lines.length; i++) {
-				const [path, r, g, b] = lines[i].split(',');
-				if (path && r && g && b) {
+				const [all, filePath, r, g, b] = lines[i].match(
+					/(.*)\,(\d+)\,(\d+)\,(\d+)$/
+				);
+				if (isImage(filePath) && r && g && b) {
 					const tileData = {
-						path: path.trim(),
+						path: filePath.trim(),
 						r: parseInt(r.trim()),
 						g: parseInt(g.trim()),
 						b: parseInt(b.trim()),
 					};
 					tiles.push(tileData);
 					this.tileCache.set(tileData.path, tileData);
+				} else {
+					console.log(`excluding ${filePath}`);
 				}
 			}
 
 			return tiles;
 		} catch (error) {
+			console.error(error);
 			// Cache file doesn't exist or is invalid
 			return null;
 		}
@@ -233,7 +337,7 @@ class MosaicGenerator {
 	}
 
 	// Zoom into center of image by specified percentage
-	async zoomImage(imagePath, zoomFactor = 0.9) {
+	async zoomImage(imagePath, zoomFactor = defaultZoomFactor) {
 		const image = sharp(imagePath);
 		const metadata = await image.metadata();
 
@@ -264,7 +368,7 @@ class MosaicGenerator {
 		options = {}
 	) {
 		const {
-			zoomFactor = 0.9, // 10% zoom each iteration
+			zoomFactor = defaultZoomFactor, // 10% zoom each iteration
 			maxIterations = null, // null for infinite
 			zoomSteps = defaultZoomSteps, // Number of zoom steps between mosaics
 			...mosaicOptions
@@ -343,7 +447,8 @@ class MosaicGenerator {
 						zoomTileSize,
 						targetWidth,
 						targetHeight,
-						zoomOutputPath
+						zoomOutputPath,
+						mosaicResult.tiles // Pass tiles for optimization
 					);
 
 					console.log(`Zoomed mosaic completed: ${zoomOutputPath}`);
@@ -385,6 +490,7 @@ class MosaicGenerator {
 			tilePattern: this.lastTilePattern,
 			mosaicWidth: this.lastMosaicWidth,
 			mosaicHeight: this.lastMosaicHeight,
+			tiles: this.lastTiles, // Store tiles for zoom operations
 		};
 	}
 
@@ -396,8 +502,24 @@ class MosaicGenerator {
 		newTileSize,
 		targetWidth,
 		targetHeight,
-		outputPath
+		outputPath,
+		tiles = null // Add tiles parameter for optimization
 	) {
+		// Use optimized version if tiles are provided
+		if (tiles) {
+			return this.generateZoomedMosaicFromPatternOptimized(
+				tilePattern,
+				mosaicWidth,
+				mosaicHeight,
+				newTileSize,
+				targetWidth,
+				targetHeight,
+				outputPath,
+				tiles
+			);
+		}
+
+		// Fall back to original method if no tiles provided
 		console.log(
 			`Compositing ${mosaicWidth}x${mosaicHeight} mosaic with ${newTileSize}px tiles...`
 		);
@@ -408,15 +530,15 @@ class MosaicGenerator {
 		const startTime = new Date();
 
 		console.log(
-			`Full mosaic: ${fullWidth}x${fullHeight}, target: ${targetWidth}x${targetHeight}`
+			`${new Date().toISOString()} : Full mosaic: ${fullWidth}x${fullHeight}, target: ${targetWidth}x${targetHeight}`
 		);
 
 		// Create rows of tiles using the existing pattern
 		const rowBuffers = [];
 
 		for (let y = 0; y < mosaicHeight; y++) {
-			console.log(
-				`${new Date().toISOString()} : Processing row ${
+			process.stdout.write(
+				`\r${new Date().toISOString()} : Processing row ${
 					y + 1
 				} of ${mosaicHeight}`
 			);
@@ -504,6 +626,197 @@ class MosaicGenerator {
 		);
 	}
 
+	// Optimized mosaic composition using cached buffers
+	async generateZoomedMosaicFromPatternOptimized(
+		tilePattern,
+		mosaicWidth,
+		mosaicHeight,
+		newTileSize,
+		targetWidth,
+		targetHeight,
+		outputPath,
+		tiles
+	) {
+		console.log(
+			`Compositing ${mosaicWidth}x${mosaicHeight} mosaic with ${newTileSize}px tiles...`
+		);
+
+		// Pre-load tile buffers for this size
+		await this.preloadTileBuffers(tiles, newTileSize);
+
+		const fullWidth = mosaicWidth * newTileSize;
+		const fullHeight = mosaicHeight * newTileSize;
+		const startTime = new Date();
+
+		console.log(
+			`Full mosaic: ${fullWidth}x${fullHeight}, target: ${targetWidth}x${targetHeight}`
+		);
+
+		// Create the final buffer directly instead of row-by-row
+		const finalBuffer = Buffer.alloc(fullWidth * fullHeight * 3);
+
+		// Process multiple rows in parallel
+		const PARALLEL_ROWS = 4; // Process 4 rows simultaneously
+		const rowPromises = [];
+
+		for (let startY = 0; startY < mosaicHeight; startY += PARALLEL_ROWS) {
+			const endY = Math.min(startY + PARALLEL_ROWS, mosaicHeight);
+
+			const rowPromise = this.processRowBatch(
+				tilePattern,
+				startY,
+				endY,
+				mosaicWidth,
+				newTileSize,
+				fullWidth,
+				finalBuffer
+			);
+
+			rowPromises.push(rowPromise);
+		}
+
+		// Process all row batches
+		let completedBatches = 0;
+		for (const rowPromise of rowPromises) {
+			await rowPromise;
+			completedBatches++;
+			const progress = Math.round(
+				(completedBatches / rowPromises.length) * 100
+			);
+			process.stdout.write(
+				`\r${new Date().toISOString()} : Progress: ${progress}%`
+			);
+		}
+		console.log('');
+
+		// Create sharp instance and crop if needed
+		let image = sharp(finalBuffer, {
+			raw: { width: fullWidth, height: fullHeight, channels: 3 },
+		});
+
+		if (fullWidth > targetWidth || fullHeight > targetHeight) {
+			const left = Math.round((fullWidth - targetWidth) / 2);
+			const top = Math.round((fullHeight - targetHeight) / 2);
+			console.log(
+				`Cropping: ${fullWidth}x${fullHeight} -> ${targetWidth}x${targetHeight}`
+			);
+
+			image = image.extract({
+				left: Math.max(0, left),
+				top: Math.max(0, top),
+				width: Math.min(targetWidth, fullWidth),
+				height: Math.min(targetHeight, fullHeight),
+			});
+		}
+
+		await image.png().toFile(outputPath);
+		console.log(
+			`Zoomed mosaic saved: ${outputPath} in ${(
+				(new Date() - startTime) /
+				1000
+			).toFixed(0)} secs`
+		);
+	}
+
+	// Process a batch of rows in parallel
+	async processRowBatch(
+		tilePattern,
+		startY,
+		endY,
+		mosaicWidth,
+		tileSize,
+		fullWidth,
+		finalBuffer
+	) {
+		const rowPromises = [];
+
+		for (let y = startY; y < endY; y++) {
+			const rowPromise = this.processRow(
+				y,
+				tilePattern[y],
+				mosaicWidth,
+				tileSize,
+				fullWidth,
+				finalBuffer
+			);
+			rowPromises.push(rowPromise);
+		}
+
+		await Promise.all(rowPromises);
+	}
+
+	// Process a single row
+	async processRow(
+		y,
+		rowPattern,
+		mosaicWidth,
+		tileSize,
+		fullWidth,
+		finalBuffer
+	) {
+		const rowStartOffset = y * fullWidth * tileSize * 3;
+
+		// Process tiles in this row in parallel
+		const tilePromises = [];
+		for (let x = 0; x < mosaicWidth; x++) {
+			const tilePath = rowPattern[x];
+			const tilePromise = this.placeTile(
+				tilePath,
+				x,
+				y,
+				tileSize,
+				fullWidth,
+				finalBuffer,
+				rowStartOffset
+			);
+			tilePromises.push(tilePromise);
+		}
+
+		await Promise.all(tilePromises);
+	}
+
+	// Place a single tile in the final buffer
+	async placeTile(
+		tilePath,
+		x,
+		y,
+		tileSize,
+		fullWidth,
+		finalBuffer,
+		rowStartOffset
+	) {
+		let tileBuffer = this.getCachedTileBuffer(tilePath, tileSize);
+
+		if (!tileBuffer) {
+			// Fallback: load tile on demand (shouldn't happen with preloading)
+			try {
+				tileBuffer = await sharp(tilePath)
+					.resize(tileSize, tileSize)
+					.raw()
+					.toBuffer();
+			} catch (error) {
+				// Create gray fallback
+				tileBuffer = Buffer.alloc(tileSize * tileSize * 3, 128);
+			}
+		}
+
+		// Copy tile data to final buffer
+		const tileStartX = x * tileSize;
+
+		for (let ty = 0; ty < tileSize; ty++) {
+			const srcRowStart = ty * tileSize * 3;
+			const dstRowStart = rowStartOffset + ty * fullWidth * 3 + tileStartX * 3;
+
+			// Copy entire row of tile at once
+			tileBuffer.copy(
+				finalBuffer,
+				dstRowStart,
+				srcRowStart,
+				srcRowStart + tileSize * 3
+			);
+		}
+	}
+
 	// Generate the mosaic
 	async generateMosaic(
 		inputImagePath,
@@ -539,18 +852,21 @@ class MosaicGenerator {
 		if (tiles) {
 			console.log(`Loaded ${tiles.length} tiles from cache`);
 
-			// Just blacklist known problematic files without validation
-			const knownCorruptedFiles = [
-				'\\TINYTIM\\Quaffle\\Multimedia\\Misc\\European art\\W\\WILLIAM-ADOLPHE Bouguereau\\WILLIAM-ADOLPHE Bouguereau - Madonna-Roses.jpg',
-			];
+			// Validate cached tiles have proper extensions and exist
+			tiles = tiles.filter((tile) => {
+				if (!tile || !tile.path) {
+					return false;
+				}
+				if (!isImage(tile.path)) {
+					console.warn(
+						`Removing invalid cached tile (no image extension): ${tile.path}`
+					);
+					this.corruptedTiles.add(tile.path);
+					return false;
+				}
 
-			// Add known corrupted files to blacklist
-			knownCorruptedFiles.forEach((path) => {
-				this.corruptedTiles.add(path);
+				return true;
 			});
-			console.log(
-				`Blacklisted ${knownCorruptedFiles.length} known problematic tiles`
-			);
 
 			// Get tile files from cache instead of scanning directory
 			tileFiles = tiles.map((tile) => tile.path);
@@ -567,19 +883,7 @@ class MosaicGenerator {
 			// } else {
 			// 	console.log('No new tiles found');
 			// }
-		} else {
-			// No cache exists, need to scan all files
-			console.log('Scanning for tile images...');
-			tileFiles = await this.getImageFiles(tilesDirectory);
 
-			if (tileFiles.length === 0) {
-				throw new Error(`No image files found in ${tilesDirectory}`);
-			}
-
-			console.log(`Found ${tileFiles.length} tile images`);
-		}
-
-		if (tiles) {
 			// Check if we have new files not in cache
 			const cachedPaths = new Set(tiles.map((tile) => tile.path));
 			const newTileFiles = tileFiles.filter((file) => !cachedPaths.has(file));
@@ -611,7 +915,12 @@ class MosaicGenerator {
 				console.log('No new tiles to process');
 			}
 		} else {
-			console.log('No cache found. Processing all tile images...');
+			console.log(
+				`No cache found at ${cacheFilePath}. Scanning for tile images...`
+			);
+			tileFiles = await this.getImageFiles(tilesDirectory);
+
+			console.log(`Found ${tileFiles.length} tile images`);
 			tiles = [];
 			let processed = 0;
 
@@ -622,7 +931,9 @@ class MosaicGenerator {
 				}
 				processed++;
 				if (processed % 50 === 0) {
-					console.log(`Processed ${processed}/${tileFiles.length} tiles`);
+					process.stdout.write(
+						`\rProcessed ${processed}/${tileFiles.length} tiles`
+					);
 				}
 			}
 
@@ -636,6 +947,9 @@ class MosaicGenerator {
 		if (tiles.length === 0) {
 			throw new Error('No valid tile images could be processed');
 		}
+
+		// Store tiles for zoom operations
+		this.lastTiles = tiles;
 
 		console.log(`Processed ${tiles.length} valid tiles`);
 		if (this.corruptedTiles.size > 0) {
@@ -714,7 +1028,7 @@ class MosaicGenerator {
 		this.lastMosaicHeight = finalMosaicHeight;
 
 		console.log(
-			`Compositing final ${finalMosaicWidth} x ${finalMosaicHeight} mosaic...`
+			`${new Date().toISOString()} : Compositing final ${finalMosaicWidth} x ${finalMosaicHeight} mosaic...`
 		);
 
 		// Create final mosaic more efficiently by processing row by row
@@ -727,8 +1041,8 @@ class MosaicGenerator {
 		const rowBuffers = [];
 
 		for (let y = 0; y < finalMosaicHeight; y++) {
-			console.log(
-				`${new Date().toISOString()} : Processing row ${
+			process.stdout.write(
+				`\r${new Date().toISOString()} : Processing row ${
 					y + 1
 				} of ${finalMosaicHeight}`
 			);
@@ -884,7 +1198,9 @@ async function main() {
 		);
 		console.log('  --infinite-zoom      Generate infinite zoom sequence');
 		console.log(
-			'  --zoom-factor <num>  Zoom factor per iteration (default: 0.9 = 10% zoom)'
+			`  --zoom-factor <num>  Zoom factor per iteration (default: ${defaultZoomFactor} = ${Math.round(
+				(1 - defaultZoomFactor) * 100
+			)}% zoom out per iteration)`
 		);
 		console.log(
 			`  --zoom-steps <num>   Number of zoom steps between mosaics (default: ${defaultZoomSteps})`
@@ -923,7 +1239,7 @@ async function main() {
 		tileSize: defaultTileSize,
 		allowReuse: true,
 		infiniteZoom: false,
-		zoomFactor: 0.9,
+		zoomFactor: defaultZoomFactor,
 		zoomSteps: defaultZoomSteps,
 		maxIterations: null,
 	};
@@ -1025,3 +1341,12 @@ if (require.main === module) {
 }
 
 module.exports = { MosaicGenerator };
+
+function isImage(filename) {
+	if (filename) {
+		const ext = path.extname(filename).toLowerCase();
+		// console.log(`filename: ${filename}, ext: ${ext}`);
+		return imageExtensions.includes(ext);
+	}
+	return false;
+}

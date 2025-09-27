@@ -2,31 +2,31 @@ const fs = require('fs');
 const path = require('path');
 const { exec, spawn } = require('child_process');
 
-// Check if FFmpeg is available
-function checkFFmpegAvailability() {
-	return new Promise((resolve) => {
-		exec('ffmpeg -version', (error) => {
-			resolve(!error);
-		});
-	});
-}
+// // Check if FFmpeg is available
+// function checkFFmpegAvailability() {
+// 	return new Promise((resolve) => {
+// 		exec('ffmpeg -version', (error) => {
+// 			resolve(!error);
+// 		});
+// 	});
+// }
 
-// Download and install FFmpeg (Windows)
-function installFFmpegWindows() {
-	console.log('FFmpeg not found. Attempting to install...');
+// // Download and install FFmpeg (Windows)
+// function installFFmpegWindows() {
+// 	console.log('FFmpeg not found. Attempting to install...');
 
-	// For Windows, we'll provide instructions since automatic installation is complex
-	console.log('\n=== FFmpeg Installation Instructions ===');
-	console.log(
-		'1. Download FFmpeg from: https://ffmpeg.org/download.html#build-windows'
-	);
-	console.log('2. Or use chocolatey: choco install ffmpeg');
-	console.log('3. Or use winget: winget install Gyan.FFmpeg');
-	console.log('4. Make sure ffmpeg.exe is in your PATH');
-	console.log('\nAlternatively, this script can try using Node.js packages...');
+// 	// For Windows, we'll provide instructions since automatic installation is complex
+// 	console.log('\n=== FFmpeg Installation Instructions ===');
+// 	console.log(
+// 		'1. Download FFmpeg from: https://ffmpeg.org/download.html#build-windows'
+// 	);
+// 	console.log('2. Or use chocolatey: choco install ffmpeg');
+// 	console.log('3. Or use winget: winget install Gyan.FFmpeg');
+// 	console.log('4. Make sure ffmpeg.exe is in your PATH');
+// 	console.log('\nAlternatively, this script can try using Node.js packages...');
 
-	return false;
-}
+// 	return false;
+// }
 
 function getImageFiles(directory) {
 	const supportedExtensions = [
@@ -134,9 +134,6 @@ async function createVideoWithNodeJS(
 	console.log('Attempting to create video using Node.js approach...');
 
 	try {
-		// Try to require sharp (already in package.json)
-		const sharp = require('sharp');
-
 		console.log('Creating an image sequence batch file for FFmpeg...');
 
 		// Create a batch file that can be run when FFmpeg is available
