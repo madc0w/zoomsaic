@@ -14,6 +14,7 @@
 const fs = require('fs').promises;
 const path = require('path');
 const sharp = require('sharp');
+const crypto = require('crypto');
 // const Jimp = require('jimp');
 
 const defaultTileSize = 8;
@@ -29,7 +30,140 @@ class MosaicGenerator {
 		this.tileSize = defaultTileSize; // Size of each mosaic tile
 		this.corruptedTiles = new Set(); // Track corrupted tiles to avoid reusing them
 		this.tileBufferCache = new Map(); // Map<tilePath_size, Buffer>
+		this.diskCacheDir = null; // Will be set when generating mosaic
+		this.writeQueue = []; // Queue for pending disk writes
+		this.activeWrites = 0; // Track active write operations
+		this.maxConcurrentWrites = 12; // Increased concurrent writes for better performance
+		// Cache statistics
+		this.cacheStats = {
+			memoryHits: 0,
+			diskHits: 0,
+			cacheMisses: 0,
+			totalRequests: 0,
+		};
 	}
+
+	// Initialize disk cache directory
+	async initializeDiskCache(tilesDirectory) {
+		// this.diskCacheDir = path.join(tilesDirectory, '.tile_cache');
+		this.diskCacheDir = '.tile_cache';
+		try {
+			await fs.mkdir(this.diskCacheDir, { recursive: true });
+			console.log('Disk cache initialized: ' + this.diskCacheDir);
+		} catch (error) {
+			console.warn(`Could not create disk cache directory: ${error.message}`);
+			this.diskCacheDir = null;
+		}
+	}
+
+	// Generate disk cache filename for a tile
+	getDiskCacheFilename(tilePath, tileSize) {
+		if (!this.diskCacheDir) return null;
+
+		// Create a safe filename from the tile path and size
+		const hash = crypto
+			.createHash('md5')
+			.update(tilePath + '_' + tileSize)
+			.digest('hex');
+		return path.join(this.diskCacheDir, `${hash}_${tileSize}.cache`);
+	}
+
+	// Load tile buffer from disk cache
+	async loadTileBufferFromDisk(tilePath, tileSize) {
+		const cacheFilename = this.getDiskCacheFilename(tilePath, tileSize);
+		if (!cacheFilename) return null;
+
+		try {
+			const buffer = await fs.readFile(cacheFilename);
+			return buffer;
+		} catch (error) {
+			// Cache miss or error reading cache file
+			return null;
+		}
+	}
+
+	// Queue tile buffer for disk write (non-blocking)
+	queueTileBufferForDisk(tilePath, tileSize, buffer) {
+		const cacheFilename = this.getDiskCacheFilename(tilePath, tileSize);
+		if (!cacheFilename) return;
+
+		// Add to write queue
+		this.writeQueue.push({ cacheFilename, buffer });
+
+		// Process queue if not at capacity
+		this.processWriteQueue();
+	}
+
+	// Process the write queue with concurrency control
+	async processWriteQueue() {
+		// Don't start new writes if at capacity or queue is empty
+		if (
+			this.activeWrites >= this.maxConcurrentWrites ||
+			this.writeQueue.length === 0
+		) {
+			return;
+		}
+
+		const writeTask = this.writeQueue.shift();
+		if (!writeTask) return;
+
+		this.activeWrites++;
+
+		try {
+			await fs.writeFile(writeTask.cacheFilename, writeTask.buffer);
+		} catch (error) {
+			// Only log EMFILE errors differently to reduce noise
+			if (error.code === 'EMFILE') {
+				console.warn('Too many open files - reducing concurrent writes');
+				this.maxConcurrentWrites = Math.max(2, this.maxConcurrentWrites - 2);
+			} else {
+				console.warn(`Could not save tile buffer to disk: ${error.message}`);
+			}
+		} finally {
+			this.activeWrites--;
+			// Process next item in queue
+			setImmediate(() => this.processWriteQueue());
+		}
+	}
+
+	// Wait for all pending disk writes to complete
+	async flushDiskWrites() {
+		while (this.writeQueue.length > 0 || this.activeWrites > 0) {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	}
+
+	// // Clean up old cache files (optional - call periodically)
+	// async cleanupDiskCache(maxAgeHours = 24) {
+	// 	if (!this.diskCacheDir) return;
+
+	// 	try {
+	// 		const files = await fs.readdir(this.diskCacheDir);
+	// 		const cutoffTime = Date.now() - maxAgeHours * 60 * 60 * 1000;
+	// 		let cleanedCount = 0;
+
+	// 		for (const file of files) {
+	// 			if (!file.endsWith('.cache')) continue;
+
+	// 			const filePath = path.join(this.diskCacheDir, file);
+	// 			try {
+	// 				const stats = await fs.stat(filePath);
+	// 				if (stats.mtime.getTime() < cutoffTime) {
+	// 					await fs.unlink(filePath);
+	// 					cleanedCount++;
+	// 				}
+	// 			} catch (error) {
+	// 				// Ignore errors for individual files
+	// 			}
+	// 		}
+
+	// 		if (cleanedCount > 0) {
+	// 			console.log(`Cleaned up ${cleanedCount} old cache files`);
+	// 		}
+	// 	} catch (error) {
+	// 		console.warn(`Could not clean disk cache: ${error.message}`);
+	// 	}
+	// }
 
 	// Get all image files from directory and subdirectories
 	async getImageFiles(dir) {
@@ -174,95 +308,131 @@ class MosaicGenerator {
 		return dr * dr + dg * dg + db * db;
 	}
 
-	// Pre-load and cache tile buffers at specific size
-	async preloadTileBuffers(tiles, tileSize) {
-		console.log(`Pre-loading ${tiles.length} tiles at ${tileSize}px...`);
-		const cacheKey = `_${tileSize}`;
-
-		// Check if we already have tiles cached for this size
-		const cachedCount = tiles.filter((tile) =>
-			this.tileBufferCache.has(tile.path + cacheKey)
-		).length;
-
-		if (cachedCount === tiles.length) {
-			console.log(`All tiles already cached at ${tileSize}px`);
-			return;
+	// Enhanced tile buffer caching with batch loading
+	async preCacheTileBuffers(tileImages, tileSize) {
+		// Get unique tile paths from the mosaic pattern
+		const uniqueTilePaths = new Set();
+		for (const row of tileImages) {
+			for (const tilePath of row) {
+				uniqueTilePaths.add(tilePath);
+			}
 		}
 
-		// Process tiles in parallel batches
-		const BATCH_SIZE = 20; // Process 20 tiles at once
-		const batches = [];
-		for (let i = 0; i < tiles.length; i += BATCH_SIZE) {
-			batches.push(tiles.slice(i, i + BATCH_SIZE));
-		}
+		const uniqueTiles = Array.from(uniqueTilePaths);
+		console.log(
+			`Pre-caching ${uniqueTiles.length} unique tiles at ${tileSize}px...`
+		);
 
+		// Increased batch size for better performance
+		const BATCH_SIZE = 100;
 		let processed = 0;
-		for (const batch of batches) {
-			const promises = batch.map(async (tile) => {
-				const bufferCacheKey = tile.path + cacheKey;
-				if (!this.tileBufferCache.has(bufferCacheKey)) {
-					// Skip if already known to be corrupted
-					if (this.corruptedTiles.has(tile.path)) {
-						processed++;
-						return;
-					}
 
-					// Validate file path and extension
-					if (!isImage(tile.path)) {
-						console.warn(
-							`Skipping invalid file (no image extension): ${tile.path}`
-						);
-						this.corruptedTiles.add(tile.path);
-						processed++;
-						return;
-					}
+		for (let i = 0; i < uniqueTiles.length; i += BATCH_SIZE) {
+			const batch = uniqueTiles.slice(i, i + BATCH_SIZE);
 
-					try {
-						// Check if file exists and is accessible
-						const stat = await fs.stat(tile.path);
-						if (!stat.isFile()) {
-							console.warn(`Skipping non-file: ${tile.path}`);
-							this.corruptedTiles.add(tile.path);
-							processed++;
-							return;
-						}
-
-						const buffer = await sharp(tile.path)
-							.resize(tileSize, tileSize)
-							.raw()
-							.toBuffer();
-						this.tileBufferCache.set(bufferCacheKey, buffer);
-					} catch (error) {
-						if (error.code === 'ENOENT') {
-							console.warn(`File not found: ${tile.path}`);
-						} else if (error.code === 'EACCES') {
-							console.warn(`Access denied: ${tile.path}`);
-						} else {
-							console.warn(
-								`Failed to preload tile: ${tile.path} - ${error.message}`
-							);
-						}
-						this.corruptedTiles.add(tile.path);
-					}
-				}
+			// Process batch in parallel with higher concurrency
+			const promises = batch.map(async (tilePath) => {
+				await this.getCachedTileBuffer(tilePath, tileSize);
 				processed++;
 			});
 
 			await Promise.all(promises);
-			if (processed % 100 === 0 || processed === tiles.length) {
-				process.stdout.write(`\rPreloaded ${processed}/${tiles.length} tiles`);
+
+			// Less frequent progress updates
+			if (processed % 200 === 0 || processed === uniqueTiles.length) {
+				process.stdout.write(
+					`\rPre-cached ${processed}/${uniqueTiles.length} tiles`
+				);
 			}
 		}
+
 		console.log(''); // New line
+		console.log('Pre-caching completed');
 	}
 
-	// Get cached tile buffer
-	getCachedTileBuffer(tilePath, tileSize) {
+	// Get cached tile buffer with on-demand loading and disk caching
+	async getCachedTileBuffer(tilePath, tileSize) {
 		const cacheKey = tilePath + `_${tileSize}`;
-		return this.tileBufferCache.get(cacheKey);
+		this.cacheStats.totalRequests++;
+
+		// Return cached buffer if available in memory
+		if (this.tileBufferCache.has(cacheKey)) {
+			this.cacheStats.memoryHits++;
+			return this.tileBufferCache.get(cacheKey);
+		}
+
+		// Skip if already known to be corrupted
+		if (this.corruptedTiles.has(tilePath)) {
+			return null;
+		}
+
+		// Try to load from disk cache first
+		let buffer = await this.loadTileBufferFromDisk(tilePath, tileSize);
+
+		if (buffer) {
+			// Cache hit - store in memory and return
+			this.cacheStats.diskHits++;
+			this.tileBufferCache.set(cacheKey, buffer);
+			return buffer;
+		}
+
+		// Cache miss - load and cache the tile buffer on-demand
+		this.cacheStats.cacheMisses++;
+		try {
+			buffer = await sharp(tilePath)
+				.resize(tileSize, tileSize)
+				.raw()
+				.toBuffer();
+
+			// Store in memory cache immediately
+			this.tileBufferCache.set(cacheKey, buffer);
+
+			// Queue for disk write (non-blocking)
+			this.queueTileBufferForDisk(tilePath, tileSize, buffer);
+
+			return buffer;
+		} catch (error) {
+			console.warn(`Failed to load tile: ${tilePath} - ${error.message}`);
+			this.corruptedTiles.add(tilePath);
+			return null;
+		}
 	}
 
-	// Find the best matching tile for a given color
+	// Check how many tiles are cached on disk for a given size
+	async checkDiskCacheSize(tileSize) {
+		if (!this.diskCacheDir) return 0;
+
+		try {
+			const files = await fs.readdir(this.diskCacheDir);
+			const cacheFiles = files.filter((file) =>
+				file.endsWith(`_${tileSize}.cache`)
+			);
+			return cacheFiles.length;
+		} catch (error) {
+			return 0;
+		}
+	}
+
+	// Print cache statistics
+	async printCacheStats(tileSize) {
+		const stats = this.cacheStats;
+		const hitRate =
+			stats.totalRequests > 0
+				? (
+						((stats.memoryHits + stats.diskHits) / stats.totalRequests) *
+						100
+				  ).toFixed(1)
+				: '0.0';
+		const diskCacheCount = await this.checkDiskCacheSize(tileSize);
+
+		console.log(`Cache stats for ${tileSize}px tiles:`);
+		console.log(`  Memory hits: ${stats.memoryHits}`);
+		console.log(`  Disk hits: ${stats.diskHits}`);
+		console.log(`  Cache misses: ${stats.cacheMisses}`);
+		console.log(`  Total requests: ${stats.totalRequests}`);
+		console.log(`  Hit rate: ${hitRate}%`);
+		console.log(`  Disk cache files: ${diskCacheCount}`);
+	} // Find the best matching tile for a given color
 	findBestTile(targetColor, tiles) {
 		// Filter out corrupted tiles upfront
 		const validTiles = tiles.filter(
@@ -634,22 +804,18 @@ class MosaicGenerator {
 		newTileSize,
 		targetWidth,
 		targetHeight,
-		outputPath,
-		tiles
+		outputPath
 	) {
 		console.log(
 			`Compositing ${mosaicWidth}x${mosaicHeight} mosaic with ${newTileSize}px tiles...`
 		);
-
-		// Pre-load tile buffers for this size
-		await this.preloadTileBuffers(tiles, newTileSize);
 
 		const fullWidth = mosaicWidth * newTileSize;
 		const fullHeight = mosaicHeight * newTileSize;
 		const startTime = new Date();
 
 		console.log(
-			`Full mosaic: ${fullWidth}x${fullHeight}, target: ${targetWidth}x${targetHeight}`
+			`${new Date().toISOString()} : Full mosaic: ${fullWidth}x${fullHeight}, target: ${targetWidth}x${targetHeight}`
 		);
 
 		// Create the final buffer directly instead of row-by-row
@@ -661,7 +827,6 @@ class MosaicGenerator {
 
 		for (let startY = 0; startY < mosaicHeight; startY += PARALLEL_ROWS) {
 			const endY = Math.min(startY + PARALLEL_ROWS, mosaicHeight);
-
 			const rowPromise = this.processRowBatch(
 				tilePattern,
 				startY,
@@ -785,19 +950,11 @@ class MosaicGenerator {
 		finalBuffer,
 		rowStartOffset
 	) {
-		let tileBuffer = this.getCachedTileBuffer(tilePath, tileSize);
+		let tileBuffer = await this.getCachedTileBuffer(tilePath, tileSize);
 
 		if (!tileBuffer) {
-			// Fallback: load tile on demand (shouldn't happen with preloading)
-			try {
-				tileBuffer = await sharp(tilePath)
-					.resize(tileSize, tileSize)
-					.raw()
-					.toBuffer();
-			} catch (error) {
-				// Create gray fallback
-				tileBuffer = Buffer.alloc(tileSize * tileSize * 3, 128);
-			}
+			// Create gray fallback for corrupted tiles
+			tileBuffer = Buffer.alloc(tileSize * tileSize * 3, 128);
 		}
 
 		// Copy tile data to final buffer
@@ -808,6 +965,129 @@ class MosaicGenerator {
 			const dstRowStart = rowStartOffset + ty * fullWidth * 3 + tileStartX * 3;
 
 			// Copy entire row of tile at once
+			tileBuffer.copy(
+				finalBuffer,
+				dstRowStart,
+				srcRowStart,
+				srcRowStart + tileSize * 3
+			);
+		}
+	}
+
+	// Optimized batch processing with cached buffers
+	async processRowBatchOptimized(
+		tileImages,
+		startY,
+		endY,
+		mosaicWidth,
+		tileSize,
+		finalWidth,
+		finalBuffer,
+		inputData
+	) {
+		const rowPromises = [];
+
+		for (let y = startY; y < endY; y++) {
+			const rowPromise = this.processRowOptimized(
+				y,
+				tileImages[y],
+				mosaicWidth,
+				tileSize,
+				finalWidth,
+				finalBuffer,
+				inputData
+			);
+			rowPromises.push(rowPromise);
+		}
+
+		await Promise.all(rowPromises);
+	}
+
+	// Process a single row with cached buffers
+	async processRowOptimized(
+		y,
+		rowTileImages,
+		mosaicWidth,
+		tileSize,
+		finalWidth,
+		finalBuffer,
+		inputData
+	) {
+		// Process all tiles in this row in parallel
+		const tilePromises = [];
+		for (let x = 0; x < mosaicWidth; x++) {
+			const tilePath = rowTileImages[x];
+			const tilePromise = this.placeTileOptimized(
+				tilePath,
+				x,
+				y,
+				tileSize,
+				finalWidth,
+				finalBuffer,
+				inputData,
+				mosaicWidth
+			);
+			tilePromises.push(tilePromise);
+		}
+
+		await Promise.all(tilePromises);
+	}
+
+	// Place a single tile using cached buffer
+	async placeTileOptimized(
+		tilePath,
+		x,
+		y,
+		tileSize,
+		finalWidth,
+		finalBuffer,
+		inputData,
+		mosaicWidth
+	) {
+		let tileBuffer = await this.getCachedTileBuffer(tilePath, tileSize);
+
+		if (!tileBuffer) {
+			// Handle corrupted tile with fallback
+			console.warn(`Tile failed during compositing: ${tilePath}`);
+			this.corruptedTiles.add(tilePath);
+
+			// Get target color for replacement
+			const pixelIndex = (y * mosaicWidth + x) * 3;
+			const targetColor = {
+				r: inputData[pixelIndex],
+				g: inputData[pixelIndex + 1],
+				b: inputData[pixelIndex + 2],
+			};
+
+			// Find replacement tile
+			const availableTiles = this.lastTiles.filter(
+				(tile) => !this.corruptedTiles.has(tile.path)
+			);
+
+			if (availableTiles.length > 0) {
+				const replacementTile = this.findBestTile(targetColor, availableTiles);
+				tileBuffer = await this.getCachedTileBuffer(
+					replacementTile.path,
+					tileSize
+				);
+			}
+
+			// Final fallback to gray tile
+			if (!tileBuffer) {
+				tileBuffer = Buffer.alloc(tileSize * tileSize * 3, 128);
+			}
+		}
+
+		// Calculate position in final buffer
+		const startX = x * tileSize;
+		const startY = y * tileSize;
+
+		// Copy tile data efficiently using bulk operations
+		for (let ty = 0; ty < tileSize; ty++) {
+			const srcRowStart = ty * tileSize * 3;
+			const dstRowStart = (startY + ty) * finalWidth * 3 + startX * 3;
+
+			// Copy entire row of the tile at once - much faster than pixel by pixel
 			tileBuffer.copy(
 				finalBuffer,
 				dstRowStart,
@@ -839,6 +1119,9 @@ class MosaicGenerator {
 		const finalMosaicWidth = computedMosaicWidth;
 
 		this.tileSize = tileSize;
+
+		// Initialize disk cache for tile buffers
+		await this.initializeDiskCache(tilesDirectory);
 
 		console.log('Loading input image...');
 		const inputMetadata = await sharp(inputImagePath).metadata();
@@ -1027,106 +1310,57 @@ class MosaicGenerator {
 		this.lastMosaicWidth = finalMosaicWidth;
 		this.lastMosaicHeight = finalMosaicHeight;
 
+		// Pre-cache all tiles that will be used in this mosaic
+		await this.preCacheTileBuffers(tileImages, tileSize);
+
 		console.log(
 			`${new Date().toISOString()} : Compositing final ${finalMosaicWidth} x ${finalMosaicHeight} mosaic...`
 		);
 
-		// Create final mosaic more efficiently by processing row by row
+		// Use optimized compositing
 		const finalWidth = finalMosaicWidth * tileSize;
 		const finalHeight = finalMosaicHeight * tileSize;
-
 		const startTime = new Date();
 
-		// Create rows of tiles and then combine them
-		const rowBuffers = [];
+		// Create final buffer and process in parallel
+		const finalBuffer = Buffer.alloc(finalWidth * finalHeight * 3);
 
-		for (let y = 0; y < finalMosaicHeight; y++) {
-			process.stdout.write(
-				`\r${new Date().toISOString()} : Processing row ${
-					y + 1
-				} of ${finalMosaicHeight}`
+		// Process multiple rows in parallel
+		const PARALLEL_ROWS = 8; // Adjust based on your system
+		const rowPromises = [];
+
+		for (let startY = 0; startY < finalMosaicHeight; startY += PARALLEL_ROWS) {
+			const endY = Math.min(startY + PARALLEL_ROWS, finalMosaicHeight);
+
+			const rowPromise = this.processRowBatchOptimized(
+				tileImages,
+				startY,
+				endY,
+				finalMosaicWidth,
+				tileSize,
+				finalWidth,
+				finalBuffer,
+				inputData
 			);
 
-			// Process all tiles in this row
-			const tileBuffers = [];
-			for (let x = 0; x < finalMosaicWidth; x++) {
-				const tilePath = tileImages[y][x];
-				try {
-					const tileBuffer = await sharp(tilePath)
-						.resize(tileSize, tileSize)
-						.raw()
-						.toBuffer();
-					tileBuffers.push(tileBuffer);
-				} catch (error) {
-					console.warn(
-						`Tile failed during compositing at row ${y + 1}, column ${
-							x + 1
-						}: ${tilePath}`
-					);
-					console.warn(`Error details: ${error.message}`);
-
-					// Mark this tile as corrupted for future avoidance
-					this.corruptedTiles.add(tilePath);
-
-					// Find a replacement tile on the fly
-					const pixelIndex = (y * finalMosaicWidth + x) * 3;
-					const targetColor = {
-						r: inputData[pixelIndex],
-						g: inputData[pixelIndex + 1],
-						b: inputData[pixelIndex + 2],
-					};
-
-					// Get available tiles excluding corrupted ones
-					const availableTiles = tiles.filter(
-						(tile) => !this.corruptedTiles.has(tile.path)
-					);
-					if (availableTiles.length === 0) {
-						throw new Error(
-							'No valid tiles remaining after filtering corrupted tiles'
-						);
-					}
-
-					const replacementTile = this.findBestTile(
-						targetColor,
-						availableTiles
-					);
-					console.warn(`Using replacement tile: ${replacementTile.path}`);
-
-					// Process the replacement tile
-					const tileBuffer = await sharp(replacementTile.path)
-						.resize(tileSize, tileSize)
-						.raw()
-						.toBuffer();
-					tileBuffers.push(tileBuffer);
-				}
-			}
-
-			// Combine tiles horizontally to create a row
-			const rowWidth = finalMosaicWidth * tileSize;
-			const rowHeight = tileSize;
-			const rowBuffer = Buffer.alloc(rowWidth * rowHeight * 3);
-
-			for (let x = 0; x < finalMosaicWidth; x++) {
-				const tileBuffer = tileBuffers[x];
-				for (let ty = 0; ty < tileSize; ty++) {
-					for (let tx = 0; tx < tileSize; tx++) {
-						const srcOffset = (ty * tileSize + tx) * 3;
-						const dstOffset = (ty * rowWidth + (x * tileSize + tx)) * 3;
-
-						rowBuffer[dstOffset] = tileBuffer[srcOffset]; // R
-						rowBuffer[dstOffset + 1] = tileBuffer[srcOffset + 1]; // G
-						rowBuffer[dstOffset + 2] = tileBuffer[srcOffset + 2]; // B
-					}
-				}
-			}
-
-			rowBuffers.push(rowBuffer);
+			rowPromises.push(rowPromise);
 		}
 
-		console.log('Combining rows into final image...');
-
-		// Combine all rows vertically
-		const finalBuffer = Buffer.concat(rowBuffers);
+		// Process all row batches with progress tracking
+		let completedBatches = 0;
+		for (const rowPromise of rowPromises) {
+			await rowPromise;
+			completedBatches++;
+			const rowsCompleted = Math.min(
+				completedBatches * PARALLEL_ROWS,
+				finalMosaicHeight
+			);
+			const progress = Math.round((rowsCompleted / finalMosaicHeight) * 100);
+			process.stdout.write(
+				`\r${new Date().toISOString()} : Processing row ${rowsCompleted} of ${finalMosaicHeight} (${progress}%)`
+			);
+		}
+		console.log('');
 
 		// Save the final image
 		await sharp(finalBuffer, {
@@ -1151,6 +1385,9 @@ class MosaicGenerator {
 				finalMosaicWidth * finalMosaicHeight
 			} total`
 		);
+
+		// Print cache statistics
+		await this.printCacheStats(tileSize);
 
 		if (this.corruptedTiles.size > 0) {
 			console.log(
