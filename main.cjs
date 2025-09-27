@@ -33,7 +33,7 @@ class MosaicGenerator {
 		this.diskCacheDir = null; // Will be set when generating mosaic
 		this.writeQueue = []; // Queue for pending disk writes
 		this.activeWrites = 0; // Track active write operations
-		this.maxConcurrentWrites = 12; // Increased concurrent writes for better performance
+		this.maxConcurrentWrites = 5; // Conservative limit to prevent file handle exhaustion
 		// Cache statistics
 		this.cacheStats = {
 			memoryHits: 0,
@@ -676,7 +676,15 @@ class MosaicGenerator {
 		tiles = null // Add tiles parameter for optimization
 	) {
 		// Use optimized version if tiles are provided
-		if (tiles) {
+		console.log(
+			`DEBUG: tiles parameter = ${
+				tiles ? 'PROVIDED' : 'NULL'
+			}, type = ${typeof tiles}`
+		);
+		if (tiles && Array.isArray(tiles) && tiles.length > 0) {
+			console.log(
+				`Using OPTIMIZED smart cropping method with ${tiles.length} tiles available`
+			);
 			return this.generateZoomedMosaicFromPatternOptimized(
 				tilePattern,
 				mosaicWidth,
@@ -690,6 +698,9 @@ class MosaicGenerator {
 		}
 
 		// Fall back to original method if no tiles provided
+		console.log(
+			`WARNING: Using SLOW fallback method - tiles parameter not provided!`
+		);
 		console.log(
 			`Compositing ${mosaicWidth}x${mosaicHeight} mosaic with ${newTileSize}px tiles...`
 		);
@@ -804,43 +815,77 @@ class MosaicGenerator {
 		newTileSize,
 		targetWidth,
 		targetHeight,
-		outputPath
+		outputPath,
+		tiles
 	) {
 		console.log(
-			`Compositing ${mosaicWidth}x${mosaicHeight} mosaic with ${newTileSize}px tiles...`
+			`SMART CROPPING: ${mosaicWidth}x${mosaicHeight} mosaic with ${newTileSize}px tiles...`
 		);
 
 		const fullWidth = mosaicWidth * newTileSize;
 		const fullHeight = mosaicHeight * newTileSize;
 		const startTime = new Date();
 
-		console.log(
-			`${new Date().toISOString()} : Full mosaic: ${fullWidth}x${fullHeight}, target: ${targetWidth}x${targetHeight}`
+		// Calculate crop region in tile coordinates
+		const cropLeft = Math.round((fullWidth - targetWidth) / 2);
+		const cropTop = Math.round((fullHeight - targetHeight) / 2);
+		const cropRight = cropLeft + targetWidth;
+		const cropBottom = cropTop + targetHeight;
+
+		// Calculate which tiles are actually visible
+		const startTileX = Math.max(0, Math.floor(cropLeft / newTileSize));
+		const endTileX = Math.min(
+			mosaicWidth - 1,
+			Math.floor(cropRight / newTileSize)
+		);
+		const startTileY = Math.max(0, Math.floor(cropTop / newTileSize));
+		const endTileY = Math.min(
+			mosaicHeight - 1,
+			Math.floor(cropBottom / newTileSize)
 		);
 
-		// Create the final buffer directly instead of row-by-row
-		const finalBuffer = Buffer.alloc(fullWidth * fullHeight * 3);
+		const visibleTilesX = endTileX - startTileX + 1;
+		const visibleTilesY = endTileY - startTileY + 1;
+		const totalVisibleTiles = visibleTilesX * visibleTilesY;
+		const totalTiles = mosaicWidth * mosaicHeight;
 
-		// Process multiple rows in parallel
-		const PARALLEL_ROWS = 4; // Process 4 rows simultaneously
+		console.log(
+			`Smart cropping: Only processing ${totalVisibleTiles}/${totalTiles} tiles (${Math.round(
+				(totalVisibleTiles / totalTiles) * 100
+			)}% of full image)`
+		);
+		console.log(
+			`Visible region: tiles [${startTileX},${startTileY}] to [${endTileX},${endTileY}]`
+		);
+
+		// Calculate actual output dimensions - use target size directly
+		const outputBuffer = Buffer.alloc(targetWidth * targetHeight * 3);
+
+		// Process visible tiles in parallel batches
+		const PARALLEL_ROWS = 8;
 		const rowPromises = [];
 
-		for (let startY = 0; startY < mosaicHeight; startY += PARALLEL_ROWS) {
-			const endY = Math.min(startY + PARALLEL_ROWS, mosaicHeight);
-			const rowPromise = this.processRowBatch(
+		for (let startY = startTileY; startY <= endTileY; startY += PARALLEL_ROWS) {
+			const endY = Math.min(startY + PARALLEL_ROWS - 1, endTileY);
+
+			const rowPromise = this.processVisibleRowBatch(
 				tilePattern,
 				startY,
 				endY,
-				mosaicWidth,
+				startTileX,
+				endTileX,
 				newTileSize,
-				fullWidth,
-				finalBuffer
+				cropLeft,
+				cropTop,
+				targetWidth,
+				targetHeight,
+				outputBuffer
 			);
 
 			rowPromises.push(rowPromise);
 		}
 
-		// Process all row batches
+		// Process all row batches with progress tracking
 		let completedBatches = 0;
 		for (const rowPromise of rowPromises) {
 			await rowPromise;
@@ -849,34 +894,20 @@ class MosaicGenerator {
 				(completedBatches / rowPromises.length) * 100
 			);
 			process.stdout.write(
-				`\r${new Date().toISOString()} : Progress: ${progress}%`
+				`\r${new Date().toISOString()} : Processing visible tiles: ${progress}%`
 			);
 		}
 		console.log('');
 
-		// Create sharp instance and crop if needed
-		let image = sharp(finalBuffer, {
-			raw: { width: fullWidth, height: fullHeight, channels: 3 },
-		});
+		// Save directly without Sharp cropping
+		await sharp(outputBuffer, {
+			raw: { width: targetWidth, height: targetHeight, channels: 3 },
+		})
+			.png()
+			.toFile(outputPath);
 
-		if (fullWidth > targetWidth || fullHeight > targetHeight) {
-			const left = Math.round((fullWidth - targetWidth) / 2);
-			const top = Math.round((fullHeight - targetHeight) / 2);
-			console.log(
-				`Cropping: ${fullWidth}x${fullHeight} -> ${targetWidth}x${targetHeight}`
-			);
-
-			image = image.extract({
-				left: Math.max(0, left),
-				top: Math.max(0, top),
-				width: Math.min(targetWidth, fullWidth),
-				height: Math.min(targetHeight, fullHeight),
-			});
-		}
-
-		await image.png().toFile(outputPath);
 		console.log(
-			`Zoomed mosaic saved: ${outputPath} in ${(
+			`Smart cropped mosaic saved: ${outputPath} in ${(
 				(new Date() - startTime) /
 				1000
 			).toFixed(0)} secs`
@@ -1097,7 +1128,136 @@ class MosaicGenerator {
 		}
 	}
 
-	// Generate the mosaic
+	// Process only visible tile rows for smart cropping
+	async processVisibleRowBatch(
+		tilePattern,
+		startY,
+		endY,
+		startTileX,
+		endTileX,
+		tileSize,
+		cropLeft,
+		cropTop,
+		targetWidth,
+		targetHeight,
+		outputBuffer
+	) {
+		const rowPromises = [];
+
+		for (let y = startY; y <= endY; y++) {
+			const rowPromise = this.processVisibleRow(
+				y,
+				tilePattern[y],
+				startTileX,
+				endTileX,
+				tileSize,
+				cropLeft,
+				cropTop,
+				targetWidth,
+				targetHeight,
+				outputBuffer
+			);
+			rowPromises.push(rowPromise);
+		}
+
+		await Promise.all(rowPromises);
+	}
+
+	// Process a single row of visible tiles
+	async processVisibleRow(
+		y,
+		rowPattern,
+		startTileX,
+		endTileX,
+		tileSize,
+		cropLeft,
+		cropTop,
+		targetWidth,
+		targetHeight,
+		outputBuffer
+	) {
+		// Process tiles in this row in parallel
+		const tilePromises = [];
+		for (let x = startTileX; x <= endTileX; x++) {
+			const tilePath = rowPattern[x];
+			const tilePromise = this.placeVisibleTile(
+				tilePath,
+				x,
+				y,
+				tileSize,
+				cropLeft,
+				cropTop,
+				targetWidth,
+				targetHeight,
+				outputBuffer
+			);
+			tilePromises.push(tilePromise);
+		}
+
+		await Promise.all(tilePromises);
+	}
+
+	// Simplified tile placement - just copy entire tiles for now to avoid buffer errors
+	async placeVisibleTile(
+		tilePath,
+		x,
+		y,
+		tileSize,
+		cropLeft,
+		cropTop,
+		targetWidth,
+		targetHeight,
+		outputBuffer
+	) {
+		let tileBuffer = await this.getCachedTileBuffer(tilePath, tileSize);
+
+		if (!tileBuffer) {
+			// Create gray fallback for corrupted tiles
+			tileBuffer = Buffer.alloc(tileSize * tileSize * 3, 128);
+		}
+
+		// Calculate tile position in full mosaic coordinates
+		const tileStartX = x * tileSize;
+		const tileStartY = y * tileSize;
+
+		// Calculate output position (where this tile should go in final image)
+		const outputStartX = tileStartX - cropLeft;
+		const outputStartY = tileStartY - cropTop;
+
+		// Skip if tile is completely outside target area
+		if (
+			outputStartX + tileSize <= 0 ||
+			outputStartY + tileSize <= 0 ||
+			outputStartX >= targetWidth ||
+			outputStartY >= targetHeight
+		) {
+			return;
+		}
+
+		// For now, copy entire tile (we can optimize cropping later)
+		for (let ty = 0; ty < tileSize; ty++) {
+			const outputY = outputStartY + ty;
+			if (outputY < 0 || outputY >= targetHeight) continue;
+
+			for (let tx = 0; tx < tileSize; tx++) {
+				const outputX = outputStartX + tx;
+				if (outputX < 0 || outputX >= targetWidth) continue;
+
+				const srcOffset = (ty * tileSize + tx) * 3;
+				const dstOffset = (outputY * targetWidth + outputX) * 3;
+
+				// Copy RGB values
+				if (
+					srcOffset + 2 < tileBuffer.length &&
+					dstOffset + 2 < outputBuffer.length
+				) {
+					outputBuffer[dstOffset] = tileBuffer[srcOffset]; // R
+					outputBuffer[dstOffset + 1] = tileBuffer[srcOffset + 1]; // G
+					outputBuffer[dstOffset + 2] = tileBuffer[srcOffset + 2]; // B
+				}
+			}
+		}
+	} // Generate the mosaic
 	async generateMosaic(
 		inputImagePath,
 		tilesDirectory,
