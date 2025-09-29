@@ -17,9 +17,9 @@ const sharp = require('sharp');
 const crypto = require('crypto');
 // const Jimp = require('jimp');
 
-const defaultTileSize = 8;
+const defaultTileSize = 4;
 const defaultOutputWidth = 1024; // Default output image width in pixels
-const defaultZoomSteps = 24;
+const defaultZoomSteps = 40;
 const defaultZoomFactor = 0.88;
 
 const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
@@ -114,8 +114,10 @@ class MosaicGenerator {
 		} catch (error) {
 			// Only log EMFILE errors differently to reduce noise
 			if (error.code === 'EMFILE') {
-				console.warn('Too many open files - reducing concurrent writes');
 				this.maxConcurrentWrites = Math.max(2, this.maxConcurrentWrites - 2);
+				console.warn(
+					`Too many open files - reduced concurrent writes to ${this.maxConcurrentWrites}`
+				);
 			} else {
 				console.warn(`Could not save tile buffer to disk: ${error.message}`);
 			}
@@ -506,8 +508,13 @@ class MosaicGenerator {
 		}
 	}
 
-	// Zoom into center of image by specified percentage
-	async zoomImage(imagePath, zoomFactor = defaultZoomFactor) {
+	// Zoom into specified point of image by specified percentage
+	async zoomImage(
+		imagePath,
+		zoomFactor = defaultZoomFactor,
+		zoomPointX = 0.5,
+		zoomPointY = 0.5
+	) {
 		const image = sharp(imagePath);
 		const metadata = await image.metadata();
 
@@ -515,9 +522,18 @@ class MosaicGenerator {
 		const newWidth = Math.round(width * zoomFactor);
 		const newHeight = Math.round(height * zoomFactor);
 
-		// Calculate center crop coordinates
-		const left = Math.round((width - newWidth) / 2);
-		const top = Math.round((height - newHeight) / 2);
+		// Calculate crop coordinates based on zoom point
+		// zoomPointX/Y: 0.0 = left/top edge, 0.5 = center, 1.0 = right/bottom edge
+		const targetX = Math.round(width * zoomPointX);
+		const targetY = Math.round(height * zoomPointY);
+		const left = Math.max(
+			0,
+			Math.min(width - newWidth, targetX - Math.round(newWidth / 2))
+		);
+		const top = Math.max(
+			0,
+			Math.min(height - newHeight, targetY - Math.round(newHeight / 2))
+		);
 
 		// Create a temporary file for the zoomed image
 		const tempPath = imagePath.replace(/(\.[^.]+)$/, '_zoomed$1');
@@ -541,6 +557,9 @@ class MosaicGenerator {
 			zoomFactor = defaultZoomFactor, // 10% zoom each iteration
 			maxIterations = null, // null for infinite
 			zoomSteps = defaultZoomSteps, // Number of zoom steps between mosaics
+			zoomPointX = 0.5, // X position as fraction (0.0 = left, 1.0 = right)
+			zoomPointY = 0.5, // Y position as fraction (0.0 = top, 1.0 = bottom)
+			randomZoomMotion = 0, // Random motion amount
 			...mosaicOptions
 		} = options;
 
@@ -561,18 +580,108 @@ class MosaicGenerator {
 					Math.floor(globalFrameNumber / (zoomSteps + 1)) + 1;
 				console.log(`\n=== ITERATION ${iterationNumber} ===`);
 
+				// Check if all frames in this iteration already exist
+				let allFramesExist = true;
+				const iterationStartFrame = globalFrameNumber + 1;
+				const iterationEndFrame = iterationStartFrame + zoomSteps;
+
+				console.log(
+					`Checking frames ${iterationStartFrame} to ${iterationEndFrame} for iteration ${iterationNumber}`
+				);
+
+				for (
+					let checkFrame = iterationStartFrame;
+					checkFrame <= iterationEndFrame;
+					checkFrame++
+				) {
+					const paddedCheckFrame = checkFrame.toString().padStart(4, '0');
+					const checkPath = `${baseOutputPath}_${paddedCheckFrame}${extension}`;
+
+					try {
+						await fs.access(checkPath);
+						console.log(`Found existing file: ${checkPath}`);
+					} catch (error) {
+						// File doesn't exist
+						console.log(`Missing file: ${checkPath} - will need to generate`);
+						allFramesExist = false;
+						break;
+					}
+				}
+
+				// If all frames in this iteration exist, skip to next iteration
+				if (allFramesExist) {
+					console.log(
+						`All frames for iteration ${iterationNumber} exist, skipping to next iteration`
+					);
+					globalFrameNumber = iterationEndFrame;
+					currentInputPath = `${baseOutputPath}_${globalFrameNumber
+						.toString()
+						.padStart(4, '0')}${extension}`;
+					continue;
+				}
+
+				console.log(`Not all frames exist, proceeding with generation`);
+
+				// Apply random zoom motion if enabled
+				let currentZoomPointX = zoomPointX;
+				let currentZoomPointY = zoomPointY;
+
+				if (randomZoomMotion > 0) {
+					// Generate Gaussian random motion
+					const motionX = gaussianRandom(0, randomZoomMotion);
+					const motionY = gaussianRandom(0, randomZoomMotion);
+
+					// Apply motion and clamp to valid range
+					currentZoomPointX = Math.max(
+						0.0,
+						Math.min(1.0, zoomPointX + motionX)
+					);
+					currentZoomPointY = Math.max(
+						0.0,
+						Math.min(1.0, zoomPointY + motionY)
+					);
+
+					console.log(
+						`Random zoom motion: (${motionX.toFixed(3)}, ${motionY.toFixed(
+							3
+						)}) -> (${currentZoomPointX.toFixed(
+							3
+						)}, ${currentZoomPointY.toFixed(3)})`
+					);
+				}
+
 				// Generate mosaic first and capture tile pattern
 				globalFrameNumber++;
 				const paddedFrameNumber = globalFrameNumber.toString().padStart(4, '0');
 				const mosaicOutputPath = `${baseOutputPath}_${paddedFrameNumber}${extension}`;
 
-				console.log(`Generating initial mosaic frame ${globalFrameNumber}...`);
-				const mosaicResult = await this.generateMosaicWithTilePattern(
-					currentInputPath,
-					tilesDirectory,
-					mosaicOutputPath,
-					mosaicOptions
-				);
+				// Check if file already exists
+				let mosaicResult;
+				try {
+					await fs.access(mosaicOutputPath);
+					console.log(`Skipping existing file: ${mosaicOutputPath}`);
+
+					// If file exists, we need to generate the tile pattern without saving the image
+					// We'll call generateMosaic with a special flag to skip file writing
+					const tempOptions = { ...mosaicOptions, skipFileWrite: true };
+					mosaicResult = await this.generateMosaicWithTilePattern(
+						currentInputPath,
+						tilesDirectory,
+						null, // No output path since we're skipping file write
+						tempOptions
+					);
+				} catch (error) {
+					// File doesn't exist, generate it
+					console.log(
+						`Generating initial mosaic frame ${globalFrameNumber}...`
+					);
+					mosaicResult = await this.generateMosaicWithTilePattern(
+						currentInputPath,
+						tilesDirectory,
+						mosaicOutputPath,
+						mosaicOptions
+					);
+				}
 
 				console.log(`Mosaic completed: ${mosaicOutputPath}`);
 
@@ -582,6 +691,15 @@ class MosaicGenerator {
 					globalFrameNumber++;
 					const paddedZoomFrame = globalFrameNumber.toString().padStart(4, '0');
 					const zoomOutputPath = `${baseOutputPath}_${paddedZoomFrame}${extension}`;
+
+					// Check if zoomed frame already exists
+					try {
+						await fs.access(zoomOutputPath);
+						console.log(`Skipping existing zoomed frame: ${zoomOutputPath}`);
+						continue;
+					} catch (error) {
+						// File doesn't exist, generate it
+					}
 
 					console.log(
 						`Creating zoomed mosaic ${zoomStep}/${zoomSteps} (frame ${globalFrameNumber}, zoom step ${zoomStep})...`
@@ -618,7 +736,8 @@ class MosaicGenerator {
 						targetWidth,
 						targetHeight,
 						zoomOutputPath,
-						mosaicResult.tiles // Pass tiles for optimization
+						mosaicResult.tiles, // Pass tiles for optimization
+						{ zoomPointX: currentZoomPointX, zoomPointY: currentZoomPointY } // Pass current zoom point
 					);
 
 					console.log(`Zoomed mosaic completed: ${zoomOutputPath}`);
@@ -673,14 +792,26 @@ class MosaicGenerator {
 		targetWidth,
 		targetHeight,
 		outputPath,
-		tiles = null // Add tiles parameter for optimization
+		tiles = null, // Add tiles parameter for optimization
+		options = {}
 	) {
+		// Check if output file already exists
+		try {
+			await fs.access(outputPath);
+			console.log(
+				`Output file already exists, skipping generation: ${outputPath}`
+			);
+			return; // Skip generation
+		} catch (error) {
+			// File doesn't exist, continue with generation
+		}
+
 		// Use optimized version if tiles are provided
-		console.log(
-			`DEBUG: tiles parameter = ${
-				tiles ? 'PROVIDED' : 'NULL'
-			}, type = ${typeof tiles}`
-		);
+		// console.log(
+		// 	`DEBUG: tiles parameter = ${
+		// 		tiles ? 'PROVIDED' : 'NULL'
+		// 	}, type = ${typeof tiles}`
+		// );
 		if (tiles && Array.isArray(tiles) && tiles.length > 0) {
 			console.log(
 				`Using OPTIMIZED smart cropping method with ${tiles.length} tiles available`
@@ -693,7 +824,9 @@ class MosaicGenerator {
 				targetWidth,
 				targetHeight,
 				outputPath,
-				tiles
+				tiles,
+				options.zoomPointX || 0.5,
+				options.zoomPointY || 0.5
 			);
 		}
 
@@ -816,8 +949,21 @@ class MosaicGenerator {
 		targetWidth,
 		targetHeight,
 		outputPath,
-		tiles
+		tiles,
+		zoomPointX = 0.5,
+		zoomPointY = 0.5
 	) {
+		// Check if output file already exists
+		try {
+			await fs.access(outputPath);
+			console.log(
+				`Output file already exists, skipping generation: ${outputPath}`
+			);
+			return; // Skip generation
+		} catch (error) {
+			// File doesn't exist, continue with generation
+		}
+
 		console.log(
 			`SMART CROPPING: ${mosaicWidth}x${mosaicHeight} mosaic with ${newTileSize}px tiles...`
 		);
@@ -826,9 +972,24 @@ class MosaicGenerator {
 		const fullHeight = mosaicHeight * newTileSize;
 		const startTime = new Date();
 
-		// Calculate crop region in tile coordinates
-		const cropLeft = Math.round((fullWidth - targetWidth) / 2);
-		const cropTop = Math.round((fullHeight - targetHeight) / 2);
+		// Calculate crop region in tile coordinates based on zoom point
+		// Use the zoom point parameters passed to the method
+		const targetCenterX = Math.round(fullWidth * zoomPointX);
+		const targetCenterY = Math.round(fullHeight * zoomPointY);
+		const cropLeft = Math.max(
+			0,
+			Math.min(
+				fullWidth - targetWidth,
+				targetCenterX - Math.round(targetWidth / 2)
+			)
+		);
+		const cropTop = Math.max(
+			0,
+			Math.min(
+				fullHeight - targetHeight,
+				targetCenterY - Math.round(targetHeight / 2)
+			)
+		);
 		const cropRight = cropLeft + targetWidth;
 		const cropBottom = cropTop + targetHeight;
 
@@ -1264,13 +1425,34 @@ class MosaicGenerator {
 		outputPath,
 		options = {}
 	) {
+		// Check if output file already exists (only if we're not skipping file write)
+		if (outputPath && !options.skipFileWrite) {
+			try {
+				await fs.access(outputPath);
+				console.log(
+					`Output file already exists, skipping generation: ${outputPath}`
+				);
+				// Return minimal result data for compatibility
+				const existingImage = sharp(outputPath);
+				const metadata = await existingImage.metadata();
+				return {
+					width: metadata.width,
+					height: metadata.height,
+					tilesUsed: 0,
+					availableTiles: 0,
+					corruptedTiles: 0,
+				};
+			} catch (error) {
+				// File doesn't exist, continue with generation
+			}
+		}
+
 		const {
 			outputWidth = defaultOutputWidth, // Target output image width in pixels
 			outputHeight = null, // Target output image height in pixels (auto if null)
 			mosaicWidth = null, // Number of tiles horizontally (computed if null)
 			mosaicHeight = null, // Number of tiles vertically (auto if null)
 			tileSize = defaultTileSize, // Size of each tile in pixels
-			allowReuse = true, // Allow tiles to be reused
 		} = options;
 
 		// Compute mosaic dimensions based on output resolution
@@ -1419,8 +1601,12 @@ class MosaicGenerator {
 			`Generating ${finalMosaicWidth}x${finalMosaicHeight} mosaic...`
 		);
 
-		const usedTiles = new Set();
+		const usedTiles = new Set(); // For --no-reuse compatibility
+		const tileUsageCount = new Map(); // Track usage count for max-unique-tiles
 		const tileImages = [];
+
+		// Extract maxUniqueTiles from options
+		const maxUniqueTiles = options.maxUniqueTiles || 0;
 
 		// Generate mosaic tile by tile
 		for (let y = 0; y < finalMosaicHeight; y++) {
@@ -1434,10 +1620,15 @@ class MosaicGenerator {
 					b: inputData[pixelIndex + 2],
 				};
 
-				// Find best matching tile
+				// Find best matching tile based on reuse constraints
 				let availableTiles = tiles;
-				if (!allowReuse) {
-					availableTiles = tiles.filter((tile) => !usedTiles.has(tile));
+
+				if (maxUniqueTiles > 0) {
+					// New max-unique-tiles behavior
+					availableTiles = tiles.filter((tile) => {
+						const currentUsage = tileUsageCount.get(tile.path) || 0;
+						return currentUsage < maxUniqueTiles;
+					});
 					if (availableTiles.length === 0) {
 						availableTiles = tiles; // Fallback to all tiles if we run out
 					}
@@ -1445,8 +1636,10 @@ class MosaicGenerator {
 
 				const bestTile = this.findBestTile(targetColor, availableTiles);
 
-				if (!allowReuse) {
-					usedTiles.add(bestTile);
+				// Update usage tracking
+				if (maxUniqueTiles > 0) {
+					const currentUsage = tileUsageCount.get(bestTile.path) || 0;
+					tileUsageCount.set(bestTile.path, currentUsage + 1);
 				}
 
 				row.push(bestTile.path);
@@ -1522,23 +1715,32 @@ class MosaicGenerator {
 		}
 		console.log('');
 
-		// Save the final image
-		await sharp(finalBuffer, {
-			raw: {
-				width: finalWidth,
-				height: finalHeight,
-				channels: 3,
-			},
-		})
-			.png()
-			.toFile(outputPath);
+		// Save the final image (only if not skipping file write)
+		if (outputPath && !options.skipFileWrite) {
+			await sharp(finalBuffer, {
+				raw: {
+					width: finalWidth,
+					height: finalHeight,
+					channels: 3,
+				},
+			})
+				.png()
+				.toFile(outputPath);
 
-		console.log(
-			`Mosaic saved to: ${outputPath} in ${(
-				(new Date() - startTime) /
-				1000
-			).toFixed(0)} secs`
-		);
+			console.log(
+				`Mosaic saved to: ${outputPath} in ${(
+					(new Date() - startTime) /
+					1000
+				).toFixed(0)} secs`
+			);
+		} else {
+			console.log(
+				`Mosaic generation completed (no file saved) in ${(
+					(new Date() - startTime) /
+					1000
+				).toFixed(0)} secs`
+			);
+		}
 		console.log(`Final size: ${finalWidth}x${finalHeight} pixels`);
 		console.log(
 			`Tiles used: ${finalMosaicWidth}x${finalMosaicHeight} = ${
@@ -1593,6 +1795,9 @@ async function main() {
 		console.log(
 			"  --no-reuse           Don't reuse tiles (may result in lower quality)"
 		);
+		console.log(
+			'  --max-unique-tiles <num>  Max times a tile can be used (0=unlimited, 1=unique, etc.)'
+		);
 		console.log('  --infinite-zoom      Generate infinite zoom sequence');
 		console.log(
 			`  --zoom-factor <num>  Zoom factor per iteration (default: ${defaultZoomFactor} = ${Math.round(
@@ -1604,6 +1809,15 @@ async function main() {
 		);
 		console.log(
 			'  --max-iterations <n> Maximum iterations (default: infinite)'
+		);
+		console.log(
+			'  --zoom-point-x <num> Horizontal zoom point as fraction 0.0-1.0 (default: 0.5 = center)'
+		);
+		console.log(
+			'  --zoom-point-y <num> Vertical zoom point as fraction 0.0-1.0 (default: 0.5 = center)'
+		);
+		console.log(
+			'  --random-zoom-motion <num> Random zoom point movement with Gaussian distribution (mean motion amount)'
 		);
 		console.log('');
 		console.log('Examples:');
@@ -1622,6 +1836,9 @@ async function main() {
 		console.log(
 			'  node main.cjs photo.jpg ./tiles zoom.png --infinite-zoom --zoom-steps 6'
 		);
+		console.log(
+			'  node main.cjs photo.jpg ./tiles zoom.png --infinite-zoom --zoom-point-x 0.4 --zoom-point-y 0.4'
+		);
 		process.exit(1);
 	}
 
@@ -1634,11 +1851,14 @@ async function main() {
 		mosaicWidth: null, // Number of tiles (overrides outputWidth)
 		mosaicHeight: null,
 		tileSize: defaultTileSize,
-		allowReuse: true,
+		maxUniqueTiles: 0, // 0 = unlimited reuse
 		infiniteZoom: false,
 		zoomFactor: defaultZoomFactor,
 		zoomSteps: defaultZoomSteps,
 		maxIterations: null,
+		zoomPointX: 0.5, // Default to center
+		zoomPointY: 0.5, // Default to center
+		randomZoomMotion: 0, // Default to no random motion
 	};
 
 	for (let i = 3; i < args.length; i++) {
@@ -1664,8 +1884,8 @@ async function main() {
 			case '--tile-size':
 				options.tileSize = parseInt(args[++i]);
 				break;
-			case '--no-reuse':
-				options.allowReuse = false;
+			case '--max-unique-tiles':
+				options.maxUniqueTiles = parseInt(args[++i]);
 				break;
 			case '--infinite-zoom':
 				options.infiniteZoom = true;
@@ -1678,6 +1898,15 @@ async function main() {
 				break;
 			case '--max-iterations':
 				options.maxIterations = parseInt(args[++i]);
+				break;
+			case '--zoom-point-x':
+				options.zoomPointX = parseFloat(args[++i]);
+				break;
+			case '--zoom-point-y':
+				options.zoomPointY = parseFloat(args[++i]);
+				break;
+			case '--random-zoom-motion':
+				options.randomZoomMotion = parseFloat(args[++i]);
 				break;
 		}
 	}
@@ -1738,6 +1967,16 @@ if (require.main === module) {
 }
 
 module.exports = { MosaicGenerator };
+
+// Generate Gaussian random number using Box-Muller transform
+function gaussianRandom(mean = 0, stdDev = 1) {
+	let u = 0,
+		v = 0;
+	while (u === 0) u = Math.random(); // Converting [0,1) to (0,1)
+	while (v === 0) v = Math.random();
+	const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+	return z * stdDev + mean;
+}
 
 function isImage(filename) {
 	if (filename) {

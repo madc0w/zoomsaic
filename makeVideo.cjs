@@ -28,7 +28,7 @@ const { exec, spawn } = require('child_process');
 // 	return false;
 // }
 
-function getImageFiles(directory) {
+function getImageFiles(directory, reverse = false) {
 	const supportedExtensions = [
 		'.jpg',
 		'.jpeg',
@@ -40,12 +40,17 @@ function getImageFiles(directory) {
 
 	try {
 		const files = fs.readdirSync(directory);
-		const imageFiles = files
+		let imageFiles = files
 			.filter((file) => {
 				const ext = path.extname(file).toLowerCase();
 				return supportedExtensions.includes(ext);
 			})
 			.sort(); // Sort files alphabetically for consistent ordering
+
+		// Reverse the order if requested
+		if (reverse) {
+			imageFiles = imageFiles.reverse();
+		}
 
 		return imageFiles;
 	} catch (error) {
@@ -54,8 +59,8 @@ function getImageFiles(directory) {
 	}
 }
 
-async function createVideo(imageDirectory, fps, outputFile) {
-	const imageFiles = getImageFiles(imageDirectory);
+async function createVideo(imageDirectory, fps, outputFile, reverse = false) {
+	const imageFiles = getImageFiles(imageDirectory, reverse);
 
 	if (imageFiles.length === 0) {
 		console.error('No image files found in the specified directory.');
@@ -63,6 +68,9 @@ async function createVideo(imageDirectory, fps, outputFile) {
 	}
 
 	console.log(`Found ${imageFiles.length} image files in ${imageDirectory}`);
+	if (reverse) {
+		console.log('Frame order: REVERSED');
+	}
 	console.log('First few files:', imageFiles.slice(0, 5));
 
 	// Use the image2 demuxer approach - create symbolic links or rename files temporarily
@@ -376,7 +384,7 @@ function createVideoWithConcatImages(
 
 function showUsage() {
 	console.log(
-		'Usage: node makeVideo.cjs <image_directory> <fps> [output_file]'
+		'Usage: node makeVideo.cjs <image_directory> <fps> [output_file] [--reverse]'
 	);
 	console.log('');
 	console.log('Arguments:');
@@ -386,9 +394,14 @@ function showUsage() {
 		'  output_file     Output video file name (optional, defaults to output.mp4)'
 	);
 	console.log('');
+	console.log('Options:');
+	console.log('  --reverse       Reverse the order of frames in the video');
+	console.log('');
 	console.log('Examples:');
 	console.log('  node makeVideo.cjs ./images 30');
 	console.log('  node makeVideo.cjs C:\\path\\to\\images 24 my_video.mp4');
+	console.log('  node makeVideo.cjs ./images 30 output.mp4 --reverse');
+	console.log('  node makeVideo.cjs ./images 30 --reverse');
 	console.log('');
 	console.log('Supported image formats: JPG, JPEG, PNG, BMP, TIFF, GIF');
 }
@@ -402,9 +415,13 @@ if (args.length < 2) {
 	process.exit(1);
 }
 
-const imageDirectory = args[0];
-const fps = parseFloat(args[1]);
-const outputFile = args[2] || 'output.mp4';
+// Check for --reverse flag
+const reverseFlag = args.includes('--reverse');
+const filteredArgs = args.filter((arg) => arg !== '--reverse');
+
+const imageDirectory = filteredArgs[0];
+const fps = parseFloat(filteredArgs[1]);
+const outputFile = filteredArgs[2] || 'output.mp4';
 
 // Validate arguments
 if (!fs.existsSync(imageDirectory)) {
@@ -425,12 +442,15 @@ if (isNaN(fps) || fps <= 0) {
 console.log(`Creating video from images in: ${imageDirectory}`);
 console.log(`Frame rate: ${fps} FPS`);
 console.log(`Output file: ${outputFile}`);
+if (reverseFlag) {
+	console.log('Frame order: REVERSED');
+}
 console.log('');
 
 // Create the video
 (async () => {
 	try {
-		await createVideo(imageDirectory, fps, outputFile);
+		await createVideo(imageDirectory, fps, outputFile, reverseFlag);
 	} catch (error) {
 		console.error('Error:', error.message);
 		process.exit(1);
