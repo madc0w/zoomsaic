@@ -19,7 +19,7 @@ const crypto = require('crypto');
 
 const defaultTileSize = 4;
 const defaultOutputWidth = 1024; // Default output image width in pixels
-const defaultZoomSteps = 42;
+const defaultZoomSteps = 48;
 const defaultZoomFactor = 0.92;
 
 const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
@@ -322,7 +322,9 @@ class MosaicGenerator {
 
 		const uniqueTiles = Array.from(uniqueTilePaths);
 		console.log(
-			`Pre-caching ${uniqueTiles.length} unique tiles at ${tileSize}px...`
+			`${new Date().toISOString()} : Pre-caching ${
+				uniqueTiles.length
+			} unique tiles at ${tileSize}px...`
 		);
 
 		// Increased batch size for better performance
@@ -435,25 +437,34 @@ class MosaicGenerator {
 		console.log(`  Hit rate: ${hitRate}%`);
 		console.log(`  Disk cache files: ${diskCacheCount}`);
 	} // Find the best matching tile for a given color
-	findBestTile(targetColor, tiles) {
-		// Filter out corrupted tiles upfront
+	findBestTile(targetColor, tiles, blacklistedTilePaths = []) {
+		// Filter out corrupted tiles and blacklisted tiles upfront
 		const validTiles = tiles.filter(
-			(tile) => !this.corruptedTiles.has(tile.path)
+			(tile) =>
+				!this.corruptedTiles.has(tile.path) &&
+				!blacklistedTilePaths.includes(tile.path)
 		);
 
-		// If no valid tiles remain, throw an error
+		// If no valid tiles remain after filtering, fall back to all non-corrupted tiles
+		let tilesToSearch = validTiles;
 		if (validTiles.length === 0) {
-			throw new Error('No valid tiles available - all tiles are corrupted');
+			tilesToSearch = tiles.filter(
+				(tile) => !this.corruptedTiles.has(tile.path)
+			);
+
+			if (tilesToSearch.length === 0) {
+				throw new Error('No valid tiles available - all tiles are corrupted');
+			}
 		}
 
-		let bestTile = validTiles[0];
+		let bestTile = tilesToSearch[0];
 		let bestDistance = this.colorDistanceSq(targetColor, bestTile);
 
-		for (let i = 1; i < validTiles.length; i++) {
-			const distance = this.colorDistanceSq(targetColor, validTiles[i]);
+		for (let i = 1; i < tilesToSearch.length; i++) {
+			const distance = this.colorDistanceSq(targetColor, tilesToSearch[i]);
 			if (distance < bestDistance) {
 				bestDistance = distance;
-				bestTile = validTiles[i];
+				bestTile = tilesToSearch[i];
 			}
 		}
 
@@ -557,11 +568,10 @@ class MosaicGenerator {
 			zoomFactor = defaultZoomFactor, // 10% zoom each iteration
 			maxIterations = null, // null for infinite
 			zoomSteps = defaultZoomSteps, // Number of zoom steps between mosaics
-			zoomPointX = 0.5, // X position as fraction (0.0 = left, 1.0 = right)
-			zoomPointY = 0.5, // Y position as fraction (0.0 = top, 1.0 = bottom)
 			randomZoomMotion = 0, // Random motion amount
 			...mosaicOptions
 		} = options;
+		let { zoomPointX = 0.5, zoomPointY = 0.5 } = options;
 
 		// Parse output path to get base name and extension
 		const parsedPath = path.parse(outputPath);
@@ -622,31 +632,19 @@ class MosaicGenerator {
 
 				console.log(`Not all frames exist, proceeding with generation`);
 
-				// Apply random zoom motion if enabled
-				let currentZoomPointX = zoomPointX;
-				let currentZoomPointY = zoomPointY;
+				// Generate Gaussian random motion
+				if (randomZoomMotion) {
+					const motionX = gaussianRandom(0, randomZoomMotion || 0);
+					const motionY = gaussianRandom(0, randomZoomMotion || 0);
 
-				if (randomZoomMotion > 0) {
-					// Generate Gaussian random motion
-					const motionX = gaussianRandom(0, randomZoomMotion);
-					const motionY = gaussianRandom(0, randomZoomMotion);
-
-					// Apply motion and clamp to valid range
-					currentZoomPointX = Math.max(
-						0.0,
-						Math.min(1.0, zoomPointX + motionX)
-					);
-					currentZoomPointY = Math.max(
-						0.0,
-						Math.min(1.0, zoomPointY + motionY)
-					);
-
+					zoomPointX += motionX;
+					zoomPointX = Math.max(0.2, Math.min(0.8, zoomPointX));
+					zoomPointY += motionY;
+					zoomPointY = Math.max(0.2, Math.min(0.8, zoomPointY));
 					console.log(
 						`Random zoom motion: (${motionX.toFixed(3)}, ${motionY.toFixed(
 							3
-						)}) -> (${currentZoomPointX.toFixed(
-							3
-						)}, ${currentZoomPointY.toFixed(3)})`
+						)}) -> (${zoomPointX.toFixed(3)}, ${zoomPointY.toFixed(3)})`
 					);
 				}
 
@@ -737,7 +735,7 @@ class MosaicGenerator {
 						targetHeight,
 						zoomOutputPath,
 						mosaicResult.tiles, // Pass tiles for optimization
-						{ zoomPointX: currentZoomPointX, zoomPointY: currentZoomPointY } // Pass current zoom point
+						{ zoomPointX, zoomPointY } // Pass current zoom point
 					);
 
 					console.log(`Zoomed mosaic completed: ${zoomOutputPath}`);
@@ -1611,6 +1609,8 @@ class MosaicGenerator {
 		// Generate mosaic tile by tile
 		for (let y = 0; y < finalMosaicHeight; y++) {
 			const row = [];
+			let previousTilePath = null; // Track previous tile in this row
+
 			for (let x = 0; x < finalMosaicWidth; x++) {
 				// Get color of this pixel in the scaled input image
 				const pixelIndex = (y * finalMosaicWidth + x) * 3;
@@ -1634,7 +1634,17 @@ class MosaicGenerator {
 					}
 				}
 
-				const bestTile = this.findBestTile(targetColor, availableTiles);
+				// Prepare blacklist for avoiding adjacent duplicates
+				const blacklistedTilePaths = [];
+				if (options.avoidAdjacentDuplicates && previousTilePath) {
+					blacklistedTilePaths.push(previousTilePath);
+				}
+
+				const bestTile = this.findBestTile(
+					targetColor,
+					availableTiles,
+					blacklistedTilePaths
+				);
 
 				// Update usage tracking
 				if (maxUniqueTiles > 0) {
@@ -1643,6 +1653,7 @@ class MosaicGenerator {
 				}
 
 				row.push(bestTile.path);
+				previousTilePath = bestTile.path; // Update previous tile for next iteration
 			}
 			tileImages.push(row);
 
@@ -1798,6 +1809,9 @@ async function main() {
 		console.log(
 			'  --max-unique-tiles <num>  Max times a tile can be used (0=unlimited, 1=unique, etc.)'
 		);
+		console.log(
+			'  --avoid-adjacent-duplicates  Prevent using same tiles next to each other in a row'
+		);
 		console.log('  --infinite-zoom      Generate infinite zoom sequence');
 		console.log(
 			`  --zoom-factor <num>  Zoom factor per iteration (default: ${defaultZoomFactor} = ${Math.round(
@@ -1828,6 +1842,9 @@ async function main() {
 			'  node main.cjs photo.jpg ./tiles output.png --tile-width 150 --tile-size 24'
 		);
 		console.log(
+			'  node main.cjs photo.jpg ./tiles output.png --avoid-adjacent-duplicates'
+		);
+		console.log(
 			'  node main.cjs photo.jpg ./tiles zoom_sequence.png --infinite-zoom'
 		);
 		console.log(
@@ -1852,6 +1869,7 @@ async function main() {
 		mosaicHeight: null,
 		tileSize: defaultTileSize,
 		maxUniqueTiles: 0, // 0 = unlimited reuse
+		avoidAdjacentDuplicates: false, // Don't use same tile next to each other in a row
 		infiniteZoom: false,
 		zoomFactor: defaultZoomFactor,
 		zoomSteps: defaultZoomSteps,
@@ -1886,6 +1904,9 @@ async function main() {
 				break;
 			case '--max-unique-tiles':
 				options.maxUniqueTiles = parseInt(args[++i]);
+				break;
+			case '--avoid-adjacent-duplicates':
+				options.avoidAdjacentDuplicates = true;
 				break;
 			case '--infinite-zoom':
 				options.infiniteZoom = true;
