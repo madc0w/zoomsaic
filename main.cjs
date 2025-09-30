@@ -19,8 +19,8 @@ const crypto = require('crypto');
 
 const defaultTileSize = 4;
 const defaultOutputWidth = 1024; // Default output image width in pixels
-const defaultZoomSteps = 40;
-const defaultZoomFactor = 0.88;
+const defaultZoomSteps = 42;
+const defaultZoomFactor = 0.92;
 
 const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
 
