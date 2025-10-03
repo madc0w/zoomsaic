@@ -3,7 +3,7 @@
 	"tilesDir": "\\\\TINYTIM\\Quaffle\\Multimedia\\pics\\Photos",
 	"outputFilename": "zoomsaic",
 	"maxNonuniqueTiles": 4,
-	"randomZoomMotion": 0.02,
-	"zoomSteps": 20,
+	"randomZoomMotion": 0.004,
+	"zoomSteps": 48,
 	"zoomFactor": 0.1
 }

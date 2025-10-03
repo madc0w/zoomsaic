@@ -73,6 +73,24 @@ function distSq(a, b) {
 	return dr * dr + dg * dg + db * db;
 }
 
+// ---- Gaussian random (Box-Muller) ----
+function randn() {
+	// Standard normal N(0,1)
+	let u = 0,
+		v = 0;
+	while (u === 0) {
+		u = Math.random(); // avoid 0
+	}
+	while (v === 0) {
+		v = Math.random();
+	}
+	return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+function clamp(x, lo, hi) {
+	return Math.max(lo, Math.min(hi, x));
+}
+
 // ---- Simple 3D KD-Tree for nearest color lookup ----
 function buildKdTree(points, depth = 0) {
 	if (!points || points.length === 0) return null;
@@ -365,7 +383,8 @@ function pad4(n) {
 
 // Generate a single frame by re-mosaicing the zoomed crop of the source
 async function generateFrame({
-	frameIndex,
+	frameIndex, // for logging only (global running index)
+	stepInIteration = frameIndex, // 1..zoomSteps controls tile sizing
 	sourceImage,
 	outputWidth,
 	outputHeight,
@@ -377,8 +396,11 @@ async function generateFrame({
 	centerX = 0.5,
 	centerY = 0.5,
 }) {
-	// tile size for this frame
-	const tileSize = Math.max(1, Math.ceil(Math.pow(zoomFactor, frameIndex - 1)));
+	// tile size for this frame (reset progression per iteration)
+	const tileSize = Math.max(
+		1,
+		Math.ceil(Math.pow(zoomFactor, stepInIteration - 1))
+	);
 
 	// number of tiles in the output grid
 	const mosaicW = Math.max(1, Math.round(outputWidth / tileSize));
@@ -388,7 +410,7 @@ async function generateFrame({
 	const srcMeta = await sharp(sourceImage).metadata();
 	const srcW = srcMeta.width,
 		srcH = srcMeta.height;
-	const scale = Math.max(1, Math.pow(zoomFactor, frameIndex - 1));
+	const scale = Math.max(1, Math.pow(zoomFactor, stepInIteration - 1));
 	const cropW = Math.max(1, Math.round(srcW / scale));
 	const cropH = Math.max(1, Math.round(srcH / scale));
 	const cx = Math.round(srcW * centerX),
@@ -549,19 +571,36 @@ async function main() {
 	const meta = await sharp(sourceImage).metadata();
 	const outputHeight = Math.round(outputWidth * (meta.height / meta.width));
 
-	// Generate frames: per-frame zoom crop and remosaic, reuse grid concept only
-	const zoomSteps = Number(config.zoomSteps) || 0;
+	// Infinite iterations: each iteration renders zoomSteps frames,
+	// then uses the last frame as the next iteration's source image.
+	const zoomSteps = Math.max(1, Number(config.zoomSteps) || 1);
 	const zoomFactor = Number(config.zoomFactor);
-	if (zoomSteps > 0) {
-		let zf = zoomFactor;
-		if (!isFinite(zf) || zf <= 1) zf = 1.1;
-		for (let i = 1; i <= zoomSteps; i++) {
-			const framePath = `${outputBaseNoExt}_${pad4(i)}.png`;
-			console.log(`[frame ${i}/${zoomSteps}] -> ${framePath}`);
+	let zf = zoomFactor;
+	if (!isFinite(zf) || zf <= 1) zf = 1.1;
+
+	let centerX = 0.5,
+		centerY = 0.5;
+	const motion = Number(config.randomZoomMotion) || 0;
+
+	let globalFrame = 1;
+	let currentSource = sourceImage;
+	let iteration = 1;
+	for (;;) {
+		console.log(`[iteration ${iteration}] start; source=${currentSource}`);
+		for (let step = 1; step <= zoomSteps; step++, globalFrame++) {
+			const framePath = `${outputBaseNoExt}_${pad4(globalFrame)}.png`;
+			console.log(
+				`[frame ${globalFrame} (iter ${iteration}, step ${step}/${zoomSteps})] -> ${framePath}`
+			);
 			const t0 = Date.now();
+			if (motion > 0 && globalFrame > 1) {
+				centerX = clamp(centerX + randn() * motion, 0.2, 0.8);
+				centerY = clamp(centerY + randn() * motion, 0.2, 0.8);
+			}
 			await generateFrame({
-				frameIndex: i,
-				sourceImage,
+				frameIndex: globalFrame,
+				stepInIteration: step,
+				sourceImage: currentSource,
 				outputWidth,
 				outputHeight,
 				zoomFactor: zf,
@@ -569,28 +608,16 @@ async function main() {
 				kdTree,
 				maxNonuniqueTiles,
 				outputPath: framePath,
+				centerX,
+				centerY,
 			});
 			const secs = Math.round((Date.now() - t0) / 1000);
-			console.log(`[frame ${i}] done in ${secs}s`);
+			console.log(`[frame ${globalFrame}] done in ${secs}s`);
+			if (step === zoomSteps) {
+				currentSource = framePath; // last of the iteration becomes next source
+			}
 		}
-		console.log(
-			`[frames] Completed ${zoomSteps} frames to ${outputBaseNoExt}_####.png`
-		);
-	} else {
-		// Single frame case = use 1px tiles as base
-		const framePath = `${outputBaseNoExt}_${pad4(1)}.png`;
-		await generateFrame({
-			frameIndex: 1,
-			sourceImage,
-			outputWidth,
-			outputHeight,
-			zoomFactor: 1.1,
-			tiles,
-			kdTree,
-			maxNonuniqueTiles,
-			outputPath: framePath,
-		});
-		console.log(`[done] ${framePath}`);
+		iteration++;
 	}
 }
 
