@@ -457,7 +457,9 @@ async function generateFrame({
 		}
 		if ((y + 1) % 10 === 0 || y === mosaicH - 1) {
 			const pct = Math.round(((y + 1) / mosaicH) * 100);
-			process.stdout.write(`\r[select f${frameIndex} t${tileSize}px] ${pct}%`);
+			process.stdout.write(
+				`\r[selecting frame: ${frameIndex} tile size: ${tileSize}px] ${pct}%`
+			);
 			if (y === mosaicH - 1) process.stdout.write('\n');
 		}
 	}
@@ -527,7 +529,9 @@ async function generateFrame({
 		}
 		if ((y + 1) % 5 === 0 || y === mosaicH - 1) {
 			const pct = Math.round(((y + 1) / mosaicH) * 100);
-			process.stdout.write(`\r[compose f${frameIndex} t${tileSize}px] ${pct}%`);
+			process.stdout.write(
+				`\r[composing frame: ${frameIndex} tile size: ${tileSize}px] ${pct}%`
+			);
 			if (y === mosaicH - 1) process.stdout.write('\n');
 		}
 	}
@@ -594,8 +598,12 @@ async function main() {
 			);
 			const t0 = Date.now();
 			if (motion > 0 && globalFrame > 1) {
-				centerX = clamp(centerX + randn() * motion, 0.2, 0.8);
-				centerY = clamp(centerY + randn() * motion, 0.2, 0.8);
+				// Make motion absolute w.r.t. output by scaling by inverse zoom
+				const stepScale = Math.max(1, Math.pow(zf, step - 1));
+				const jx = (randn() * motion) / stepScale;
+				const jy = (randn() * motion) / stepScale;
+				centerX = clamp(centerX + jx, 0.2, 0.8);
+				centerY = clamp(centerY + jy, 0.2, 0.8);
 			}
 			await generateFrame({
 				frameIndex: globalFrame,
