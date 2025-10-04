@@ -7,6 +7,23 @@ const path = require('path');
 const sharp = require('sharp');
 const crypto = require('crypto');
 
+// Global error handlers for better diagnostics
+process.on('uncaughtException', (err) => {
+	try {
+		console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+	} catch (_) {}
+	process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+	try {
+		console.error(
+			'[unhandledRejection]',
+			reason && reason.stack ? reason.stack : reason
+		);
+	} catch (_) {}
+	process.exit(1);
+});
+
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']);
 
 const DEFAULT_OUTPUT_WIDTH = 1024;
@@ -47,6 +64,7 @@ async function computeAvgColor(imgPath, size = 8) {
 	const { data } = await sharp(imgPath)
 		.resize(size, size)
 		.removeAlpha()
+		.toColourspace('srgb')
 		.raw()
 		.toBuffer({ resolveWithObject: true });
 	let r = 0,
@@ -120,6 +138,261 @@ function nearestInKdTree(node, target, best = { point: null, dist: Infinity }) {
 		best = nearestInKdTree(goLeft ? right : left, target, best);
 	}
 	return best;
+}
+
+// KD-tree nearest neighbor with an allowance predicate (e.g., enforce usage limit)
+function nearestAllowedInKdTree(
+	node,
+	target,
+	isAllowed,
+	best = { point: null, dist: Infinity }
+) {
+	if (!node) return best;
+	const { point, axis, left, right } = node;
+	const d = distSq(target, point);
+	if (isAllowed(point) && d < best.dist) best = { point, dist: d };
+	const key = axis === 0 ? 'r' : axis === 1 ? 'g' : 'b';
+	const goLeft = target[key] < point[key];
+	best = nearestAllowedInKdTree(goLeft ? left : right, target, isAllowed, best);
+	const delta = target[key] - point[key];
+	if (delta * delta < best.dist) {
+		best = nearestAllowedInKdTree(
+			goLeft ? right : left,
+			target,
+			isAllowed,
+			best
+		);
+	}
+	return best;
+}
+
+// Compose a frame from a fixed pattern (tile paths), using a given tileSize.
+async function composeFrameFromPattern({
+	pattern, // 2D array of tile objects or paths
+	mosaicW,
+	mosaicH,
+	tileSize,
+	outputWidth,
+	outputHeight,
+	outputPath,
+	centerX = 0.5,
+	centerY = 0.5,
+	zoomScale = 1,
+}) {
+	const fullW = mosaicW * tileSize;
+	const fullH = mosaicH * tileSize;
+
+	// Fast path for 1px tiles: emit from RGB averages without reading any tile images
+	if (tileSize === 1) {
+		const pix = Buffer.alloc(mosaicW * mosaicH * 3);
+		for (let y = 0; y < mosaicH; y++) {
+			const row = pattern[y];
+			for (let x = 0; x < mosaicW; x++) {
+				const t = row[x];
+				const off = (y * mosaicW + x) * 3;
+				pix[off] = t.r;
+				pix[off + 1] = t.g;
+				pix[off + 2] = t.b;
+			}
+		}
+		// Crop window shrinks with zoomScale and then resize to output
+		const cropW = Math.max(
+			1,
+			Math.min(mosaicW, Math.round(mosaicW / Math.max(1, zoomScale)))
+		);
+		const cropH = Math.max(
+			1,
+			Math.min(mosaicH, Math.round(mosaicH / Math.max(1, zoomScale)))
+		);
+		const desiredLeft = Math.round(centerX * mosaicW - cropW / 2);
+		const desiredTop = Math.round(centerY * mosaicH - cropH / 2);
+		const cropLeft = Math.max(0, Math.min(mosaicW - cropW, desiredLeft));
+		const cropTop = Math.max(0, Math.min(mosaicH - cropH, desiredTop));
+		await sharp(pix, { raw: { width: mosaicW, height: mosaicH, channels: 3 } })
+			.extract({ left: cropLeft, top: cropTop, width: cropW, height: cropH })
+			.resize(outputWidth, outputHeight)
+			.png()
+			.toFile(outputPath);
+		return;
+	}
+
+	const buffer = Buffer.alloc(fullW * fullH * 3);
+
+	const memCache = new Map();
+	async function getTileBuf(p) {
+		const key = `${p}|${tileSize}`;
+		let buf = memCache.get(key);
+		if (buf) return buf;
+		buf = await readTileCacheBuffer(p, tileSize);
+		if (!buf) {
+			buf = await sharp(p)
+				.resize(tileSize, tileSize)
+				.removeAlpha()
+				.toColourspace('srgb')
+				.raw()
+				.toBuffer();
+			const expected = tileSize * tileSize * 3;
+			if (buf.length !== expected) {
+				// Force RGB 3-channel output as a fallback
+				buf = await sharp(p)
+					.resize(tileSize, tileSize)
+					.removeAlpha()
+					.toColourspace('srgb')
+					.raw()
+					.toBuffer();
+			}
+			if (buf.length === expected) {
+				writeTileCacheBuffer(p, tileSize, buf).catch(() => {});
+			}
+		}
+		memCache.set(key, buf);
+		return buf;
+	}
+
+	for (let y = 0; y < mosaicH; y++) {
+		const rowStart = y * tileSize * fullW * 3;
+		const row = pattern[y];
+		const bufs = await Promise.all(row.map((t) => getTileBuf(t.path || t)));
+		for (let x = 0; x < mosaicW; x++) {
+			const tile = bufs[x];
+			const startX = x * tileSize;
+			for (let ty = 0; ty < tileSize; ty++) {
+				const srcRow = ty * tileSize * 3;
+				const dstRow = rowStart + (ty * fullW + startX) * 3;
+				tile.copy(buffer, dstRow, srcRow, srcRow + tileSize * 3);
+			}
+		}
+		if ((y + 1) % 5 === 0 || y === mosaicH - 1) {
+			const pct = Math.round(((y + 1) / mosaicH) * 100);
+			process.stdout.write(`\r[compose pattern t${tileSize}px] ${pct}%`);
+			if (y === mosaicH - 1) process.stdout.write('\n');
+		}
+	}
+
+	// Crop size determined by zoomScale (bigger zoom => smaller window)
+	const cropW = Math.max(
+		1,
+		Math.min(fullW, Math.round(fullW / Math.max(1, zoomScale)))
+	);
+	const cropH = Math.max(
+		1,
+		Math.min(fullH, Math.round(fullH / Math.max(1, zoomScale)))
+	);
+	const desiredLeft = Math.round(centerX * fullW - cropW / 2);
+	const desiredTop = Math.round(centerY * fullH - cropH / 2);
+	const cropLeft = Math.max(0, Math.min(fullW - cropW, desiredLeft));
+	const cropTop = Math.max(0, Math.min(fullH - cropH, desiredTop));
+	const pipeline = sharp(buffer, {
+		raw: { width: fullW, height: fullH, channels: 3 },
+	});
+	await pipeline
+		.extract({ left: cropLeft, top: cropTop, width: cropW, height: cropH })
+		.resize(outputWidth, outputHeight)
+		.png()
+		.toFile(outputPath);
+}
+
+// Compute the tile selection pattern once for an iteration (enforces maxNonuniqueTiles)
+async function computeIterationPattern({
+	sourceImage,
+	outputWidth,
+	outputHeight,
+	tiles,
+	kdTree,
+	maxNonuniqueTiles,
+	centerX,
+	centerY,
+	layoutTileSize = 2, // base tile size for layout grid
+}) {
+	// Build the layout on a coarser grid to keep usage caps feasible and fast
+	const mosaicW = Math.max(
+		1,
+		Math.floor(outputWidth / Math.max(1, layoutTileSize))
+	);
+	const mosaicH = Math.max(
+		1,
+		Math.floor(outputHeight / Math.max(1, layoutTileSize))
+	);
+
+	// Prepare analysis: resize the whole source to the mosaic grid, centered as requested
+	const srcMeta = await sharp(sourceImage).metadata();
+	const srcW = srcMeta.width,
+		srcH = srcMeta.height;
+	const cx = Math.round(srcW * centerX),
+		cy = Math.round(srcH * centerY);
+	// With scale=1 (no zoom), crop is full source but we still center if bounds allow
+	const left = Math.max(0, Math.min(srcW - srcW, cx - Math.round(srcW / 2)));
+	const top = Math.max(0, Math.min(srcH - srcH, cy - Math.round(srcH / 2)));
+	const { data: analysis } = await sharp(sourceImage)
+		.extract({ left, top, width: srcW, height: srcH })
+		.resize(mosaicW, mosaicH)
+		.removeAlpha()
+		.toColourspace('srgb')
+		.raw()
+		.toBuffer({ resolveWithObject: true });
+
+	const usage = maxNonuniqueTiles > 0 ? new Map() : null;
+	const isAllowed = (t) =>
+		!usage ? true : (usage.get(t.path) || 0) < maxNonuniqueTiles;
+	const pattern = new Array(mosaicH);
+	const t0 = Date.now();
+	for (let y = 0; y < mosaicH; y++) {
+		pattern[y] = new Array(mosaicW);
+		for (let x = 0; x < mosaicW; x++) {
+			const idx = (y * mosaicW + x) * 3;
+			const color = {
+				r: analysis[idx],
+				g: analysis[idx + 1],
+				b: analysis[idx + 2],
+			};
+			let nearest = nearestAllowedInKdTree(kdTree, color, isAllowed);
+			let best = nearest.point || nearestInKdTree(kdTree, color).point;
+			if (usage) usage.set(best.path, (usage.get(best.path) || 0) + 1);
+			pattern[y][x] = best;
+		}
+
+		if ((y + 1) % 4 === 0 || y === mosaicH - 1) {
+			const pct = ((y + 1) / mosaicH) * 100;
+			const elapsed = Date.now() - t0;
+			// Track timing for the last 8 iterations for better projection accuracy
+			if (!computeIterationPattern.timings) {
+				computeIterationPattern.timings = [];
+			}
+			const timings = computeIterationPattern.timings;
+
+			let projectedTotal;
+			if (timings.length >= 2) {
+				// Calculate average time per row from recent iterations
+				const recentTimings = timings.slice(-8); // Last 8 iterations
+				const avgTimePerRow =
+					recentTimings.reduce((sum, time) => sum + time, 0) /
+					recentTimings.length;
+				projectedTotal = avgTimePerRow * mosaicH;
+			} else {
+				// Fallback to original calculation for first few iterations
+				projectedTotal = elapsed * (mosaicH / (y + 1));
+			}
+			const projectedDuration = (projectedTotal - elapsed) / 60000;
+			const projectedEndDate = new Date(Date.now() + projectedTotal - elapsed);
+
+			// Store timing for this iteration when complete
+			if (y === mosaicH - 1) {
+				timings.push(elapsed / mosaicH); // time per row
+				while (timings.length > 8) {
+					timings.shift(); // Keep only last 8
+				}
+			}
+			process.stdout.write(
+				`\r[layout iteration] ${pct.toFixed(
+					2
+				)}%  projected duration: ${projectedDuration.toFixed(
+					1
+				)} minutes, projected end: ${projectedEndDate.toISOString()}`
+			);
+			if (y === mosaicH - 1) process.stdout.write('\n');
+		}
+	}
+	return { pattern, mosaicW, mosaicH };
 }
 
 // ---- Disk cache for resized tile buffers (.tile_cache) ----
@@ -590,7 +863,21 @@ async function main() {
 	let currentSource = sourceImage;
 	let iteration = 1;
 	for (;;) {
-		console.log(`[iteration ${iteration}] start; source=${currentSource}`);
+		console.log(
+			`[iteration ${iteration}] ${new Date().toISOString()} : start; source: ${currentSource}`
+		);
+		// Compute pattern once at the start of the iteration (enforce maxNonuniqueTiles)
+		const layout = await computeIterationPattern({
+			sourceImage: currentSource,
+			outputWidth,
+			outputHeight,
+			tiles,
+			kdTree,
+			maxNonuniqueTiles,
+			centerX,
+			centerY,
+		});
+
 		for (let step = 1; step <= zoomSteps; step++, globalFrame++) {
 			const framePath = `${outputBaseNoExt}_${pad4(globalFrame)}.png`;
 			console.log(
@@ -605,24 +892,24 @@ async function main() {
 				centerX = clamp(centerX + jx, 0.2, 0.8);
 				centerY = clamp(centerY + jy, 0.2, 0.8);
 			}
-			await generateFrame({
-				frameIndex: globalFrame,
-				stepInIteration: step,
-				sourceImage: currentSource,
+			const tileSize = Math.max(1, Math.ceil(Math.pow(zf, step - 1)));
+			const zoomScale = Math.max(1, Math.pow(zf, step - 1));
+			await composeFrameFromPattern({
+				pattern: layout.pattern,
+				mosaicW: layout.mosaicW,
+				mosaicH: layout.mosaicH,
+				tileSize,
 				outputWidth,
 				outputHeight,
-				zoomFactor: zf,
-				tiles,
-				kdTree,
-				maxNonuniqueTiles,
 				outputPath: framePath,
 				centerX,
 				centerY,
+				zoomScale,
 			});
 			const secs = Math.round((Date.now() - t0) / 1000);
 			console.log(`[frame ${globalFrame}] done in ${secs}s`);
 			if (step === zoomSteps) {
-				currentSource = framePath; // last of the iteration becomes next source
+				currentSource = framePath;
 			}
 		}
 		iteration++;
@@ -631,7 +918,7 @@ async function main() {
 
 if (require.main === module) {
 	main().catch((err) => {
-		console.error('[error]', err.message);
+		console.error('[error]', err && err.stack ? err.stack : err);
 		process.exit(1);
 	});
 }
