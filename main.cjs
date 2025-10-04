@@ -182,20 +182,9 @@ async function composeFrameFromPattern({
 	const fullW = mosaicW * tileSize;
 	const fullH = mosaicH * tileSize;
 
-	// Fast path for 1px tiles: emit from RGB averages without reading any tile images
+	// Fast path for 1px tiles: emit only the visible RGB region without composing full image
 	if (tileSize === 1) {
-		const pix = Buffer.alloc(mosaicW * mosaicH * 3);
-		for (let y = 0; y < mosaicH; y++) {
-			const row = pattern[y];
-			for (let x = 0; x < mosaicW; x++) {
-				const t = row[x];
-				const off = (y * mosaicW + x) * 3;
-				pix[off] = t.r;
-				pix[off + 1] = t.g;
-				pix[off + 2] = t.b;
-			}
-		}
-		// Crop window shrinks with zoomScale and then resize to output
+		// Compute crop in tile-grid units
 		const cropW = Math.max(
 			1,
 			Math.min(mosaicW, Math.round(mosaicW / Math.max(1, zoomScale)))
@@ -208,15 +197,41 @@ async function composeFrameFromPattern({
 		const desiredTop = Math.round(centerY * mosaicH - cropH / 2);
 		const cropLeft = Math.max(0, Math.min(mosaicW - cropW, desiredLeft));
 		const cropTop = Math.max(0, Math.min(mosaicH - cropH, desiredTop));
-		await sharp(pix, { raw: { width: mosaicW, height: mosaicH, channels: 3 } })
-			.extract({ left: cropLeft, top: cropTop, width: cropW, height: cropH })
+
+		const pix = Buffer.alloc(cropW * cropH * 3);
+		for (let y = 0; y < cropH; y++) {
+			const srcRow = pattern[cropTop + y];
+			for (let x = 0; x < cropW; x++) {
+				const t = srcRow[cropLeft + x];
+				const off = (y * cropW + x) * 3;
+				pix[off] = t.r;
+				pix[off + 1] = t.g;
+				pix[off + 2] = t.b;
+			}
+		}
+		await sharp(pix, { raw: { width: cropW, height: cropH, channels: 3 } })
 			.resize(outputWidth, outputHeight)
 			.png()
 			.toFile(outputPath);
 		return;
 	}
 
-	const buffer = Buffer.alloc(fullW * fullH * 3);
+	// Compute crop window in pixel units of the composed full image
+	const cropW = Math.max(
+		1,
+		Math.min(fullW, Math.round(fullW / Math.max(1, zoomScale)))
+	);
+	const cropH = Math.max(
+		1,
+		Math.min(fullH, Math.round(fullH / Math.max(1, zoomScale)))
+	);
+	const desiredLeft = Math.round(centerX * fullW - cropW / 2);
+	const desiredTop = Math.round(centerY * fullH - cropH / 2);
+	const cropLeft = Math.max(0, Math.min(fullW - cropW, desiredLeft));
+	const cropTop = Math.max(0, Math.min(fullH - cropH, desiredTop));
+
+	// Allocate only the cropped output buffer
+	const buffer = Buffer.alloc(cropW * cropH * 3);
 
 	const memCache = new Map();
 	async function getTileBuf(p) {
@@ -249,44 +264,62 @@ async function composeFrameFromPattern({
 		return buf;
 	}
 
-	for (let y = 0; y < mosaicH; y++) {
-		const rowStart = y * tileSize * fullW * 3;
-		const row = pattern[y];
-		const bufs = await Promise.all(row.map((t) => getTileBuf(t.path || t)));
-		for (let x = 0; x < mosaicW; x++) {
-			const tile = bufs[x];
-			const startX = x * tileSize;
-			for (let ty = 0; ty < tileSize; ty++) {
-				const srcRow = ty * tileSize * 3;
-				const dstRow = rowStart + (ty * fullW + startX) * 3;
-				tile.copy(buffer, dstRow, srcRow, srcRow + tileSize * 3);
+	// Determine visible tile index ranges that intersect the crop
+	const x0 = Math.floor(cropLeft / tileSize);
+	const y0 = Math.floor(cropTop / tileSize);
+	const x1 = Math.floor((cropLeft + cropW - 1) / tileSize);
+	const y1 = Math.floor((cropTop + cropH - 1) / tileSize);
+	const visX0 = Math.max(0, x0);
+	const visY0 = Math.max(0, y0);
+	const visX1 = Math.min(mosaicW - 1, x1);
+	const visY1 = Math.min(mosaicH - 1, y1);
+
+	const totalTiles = (visX1 - visX0 + 1) * (visY1 - visY0 + 1);
+	let doneTiles = 0;
+
+	for (let tyIndex = visY0; tyIndex <= visY1; tyIndex++) {
+		const row = pattern[tyIndex];
+		const bufs = await Promise.all(
+			row.slice(visX0, visX1 + 1).map((t) => getTileBuf(t.path || t))
+		);
+		for (let ix = visX0; ix <= visX1; ix++) {
+			const tile = bufs[ix - visX0];
+			// Tile bounds in full image pixels
+			const tileLeft = ix * tileSize;
+			const tileTop = tyIndex * tileSize;
+			const interLeft = Math.max(cropLeft, tileLeft);
+			const interTop = Math.max(cropTop, tileTop);
+			const interRight = Math.min(cropLeft + cropW, tileLeft + tileSize);
+			const interBottom = Math.min(cropTop + cropH, tileTop + tileSize);
+			if (interRight <= interLeft || interBottom <= interTop) {
+				doneTiles++;
+				continue;
 			}
+			const regionW = interRight - interLeft;
+			const regionH = interBottom - interTop;
+			// Source offsets inside the tile buffer
+			const srcX = interLeft - tileLeft;
+			const srcY = interTop - tileTop;
+			// Destination offsets inside the crop buffer
+			const dstX = interLeft - cropLeft;
+			const dstY = interTop - cropTop;
+
+			for (let rowY = 0; rowY < regionH; rowY++) {
+				const srcRowOff = ((srcY + rowY) * tileSize + srcX) * 3;
+				const dstRowOff = ((dstY + rowY) * cropW + dstX) * 3;
+				const bytes = regionW * 3;
+				tile.copy(buffer, dstRowOff, srcRowOff, srcRowOff + bytes);
+			}
+			doneTiles++;
 		}
-		if ((y + 1) % 5 === 0 || y === mosaicH - 1) {
-			const pct = Math.round(((y + 1) / mosaicH) * 100);
-			process.stdout.write(`\r[compose pattern t${tileSize}px] ${pct}%`);
-			if (y === mosaicH - 1) process.stdout.write('\n');
+		if ((tyIndex - visY0 + 1) % 2 === 0 || tyIndex === visY1) {
+			const pct = Math.round((doneTiles / totalTiles) * 100);
+			process.stdout.write(`\r[compose visible t${tileSize}px] ${pct}%`);
+			if (tyIndex === visY1) process.stdout.write('\n');
 		}
 	}
 
-	// Crop size determined by zoomScale (bigger zoom => smaller window)
-	const cropW = Math.max(
-		1,
-		Math.min(fullW, Math.round(fullW / Math.max(1, zoomScale)))
-	);
-	const cropH = Math.max(
-		1,
-		Math.min(fullH, Math.round(fullH / Math.max(1, zoomScale)))
-	);
-	const desiredLeft = Math.round(centerX * fullW - cropW / 2);
-	const desiredTop = Math.round(centerY * fullH - cropH / 2);
-	const cropLeft = Math.max(0, Math.min(fullW - cropW, desiredLeft));
-	const cropTop = Math.max(0, Math.min(fullH - cropH, desiredTop));
-	const pipeline = sharp(buffer, {
-		raw: { width: fullW, height: fullH, channels: 3 },
-	});
-	await pipeline
-		.extract({ left: cropLeft, top: cropTop, width: cropW, height: cropH })
+	await sharp(buffer, { raw: { width: cropW, height: cropH, channels: 3 } })
 		.resize(outputWidth, outputHeight)
 		.png()
 		.toFile(outputPath);
@@ -345,8 +378,36 @@ async function computeIterationPattern({
 				g: analysis[idx + 1],
 				b: analysis[idx + 2],
 			};
-			let nearest = nearestAllowedInKdTree(kdTree, color, isAllowed);
-			let best = nearest.point || nearestInKdTree(kdTree, color).point;
+
+			// Avoid adjacency with left/top neighbors
+			const leftPath = x > 0 ? pattern[y][x - 1]?.path : null;
+			const topPath = y > 0 ? pattern[y - 1][x]?.path : null;
+			const isAllowedAdj = (t) =>
+				isAllowed(t) && t.path !== leftPath && t.path !== topPath;
+
+			let node = nearestAllowedInKdTree(kdTree, color, isAllowedAdj);
+			let best = node.point;
+			if (!best) {
+				// Relax adjacency progressively while honoring usage cap
+				const leftOnly = (t) => isAllowed(t) && t.path !== topPath;
+				const topOnly = (t) => isAllowed(t) && t.path !== leftPath;
+				const cand1 = nearestAllowedInKdTree(kdTree, color, leftOnly).point;
+				const cand2 = nearestAllowedInKdTree(kdTree, color, topOnly).point;
+				if (cand1 && cand2) {
+					// Choose closer of two relaxed candidates
+					best = distSq(color, cand1) <= distSq(color, cand2) ? cand1 : cand2;
+				} else {
+					best = cand1 || cand2;
+				}
+			}
+			if (!best) {
+				// Fall back to ignoring adjacency but keeping usage
+				best = nearestAllowedInKdTree(kdTree, color, isAllowed).point;
+			}
+			if (!best) {
+				// Final fallback: ignore all constraints
+				best = nearestInKdTree(kdTree, color).point;
+			}
 			if (usage) usage.set(best.path, (usage.get(best.path) || 0) + 1);
 			pattern[y][x] = best;
 		}
@@ -712,20 +773,31 @@ async function generateFrame({
 				b: analysis[idx + 2],
 			};
 
-			let best = nearestInKdTree(kdTree, color).point;
-			if (usage) {
-				// Enforce maxNonuniqueTiles by retrying with slight jitter if needed (simple fallback)
-				let tries = 0;
-				while (tries < 3) {
-					const used = usage.get(best.path) || 0;
-					if (used < maxNonuniqueTiles) break;
-					// simple jitter on one channel to move search boundary
-					color.r = Math.min(255, color.r + 1);
-					best = nearestInKdTree(kdTree, color).point;
-					tries++;
+			// Avoid adjacency with left/top neighbors
+			const leftPath = x > 0 ? selected[y][x - 1]?.path : null;
+			const topPath = y > 0 ? selected[y - 1][x]?.path : null;
+			const withinCap = (t) =>
+				!usage ? true : (usage.get(t.path) || 0) < maxNonuniqueTiles;
+			const isAllowedAdj = (t) =>
+				withinCap(t) && t.path !== leftPath && t.path !== topPath;
+
+			let node = nearestAllowedInKdTree(kdTree, color, isAllowedAdj);
+			let best = node.point;
+			if (!best) {
+				const leftOnly = (t) => withinCap(t) && t.path !== topPath;
+				const topOnly = (t) => withinCap(t) && t.path !== leftPath;
+				const cand1 = nearestAllowedInKdTree(kdTree, color, leftOnly).point;
+				const cand2 = nearestAllowedInKdTree(kdTree, color, topOnly).point;
+				if (cand1 && cand2) {
+					best = distSq(color, cand1) <= distSq(color, cand2) ? cand1 : cand2;
+				} else {
+					best = cand1 || cand2;
 				}
-				usage.set(best.path, (usage.get(best.path) || 0) + 1);
 			}
+			if (!best) best = nearestAllowedInKdTree(kdTree, color, withinCap).point;
+			if (!best) best = nearestInKdTree(kdTree, color).point;
+
+			if (usage) usage.set(best.path, (usage.get(best.path) || 0) + 1);
 			selected[y][x] = best;
 		}
 		if ((y + 1) % 10 === 0 || y === mosaicH - 1) {

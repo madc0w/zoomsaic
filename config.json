@@ -2,7 +2,7 @@
 	"sourceImage": "\\\\TINYTIM\\Quaffle\\Multimedia\\pics\\Photos\\pics 2025-07-31 Milwaukee, nyc, birthdays\\20250719_095646.jpg",
 	"tilesDir": "\\\\TINYTIM\\Quaffle\\Multimedia\\pics\\Photos",
 	"outputFilename": "zoomsaic",
-	"maxNonuniqueTiles": 4,
+	"maxNonuniqueTiles": 8,
 	"randomZoomMotion": 0.002,
 	"zoomSteps": 48,
 	"zoomFactor": 0.1
