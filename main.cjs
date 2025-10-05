@@ -33,7 +33,9 @@ function isImage(file) {
 	return IMAGE_EXTS.has(ext);
 }
 
-async function readConfig(configPath = path.join(__dirname, 'config.json')) {
+async function readConfig(
+	configPath = path.resolve(__dirname, process.argv[2] || 'config.json')
+) {
 	const absPath = path.resolve(configPath);
 	const raw = await fs.readFile(absPath, 'utf8');
 	const json = JSON.parse(raw);
@@ -408,7 +410,9 @@ async function computeIterationPattern({
 				// Final fallback: ignore all constraints
 				best = nearestInKdTree(kdTree, color).point;
 			}
-			if (usage) usage.set(best.path, (usage.get(best.path) || 0) + 1);
+			if (usage) {
+				usage.set(best.path, (usage.get(best.path) || 0) + 1);
+			}
 			pattern[y][x] = best;
 		}
 

@@ -1,6 +1,8 @@
 const fs = require('fs');
 const path = require('path');
-const { exec, spawn } = require('child_process');
+const { exec } = require('child_process');
+
+const framesPerIteration = 48;
 
 // // Check if FFmpeg is available
 // function checkFFmpegAvailability() {
@@ -28,7 +30,7 @@ const { exec, spawn } = require('child_process');
 // 	return false;
 // }
 
-function getImageFiles(directory, reverse = false) {
+function getImageFiles(directory, isReverse = false) {
 	const supportedExtensions = [
 		'.jpg',
 		'.jpeg',
@@ -43,12 +45,18 @@ function getImageFiles(directory, reverse = false) {
 		let imageFiles = files
 			.filter((file) => {
 				const ext = path.extname(file).toLowerCase();
-				return supportedExtensions.includes(ext);
+				if (supportedExtensions.includes(ext)) {
+					if (framesPerIteration) {
+						const n = file.match(/_(\d{4})\.png$/)[1];
+						return parseInt(n) % framesPerIteration !== 0;
+					}
+					return true;
+				}
 			})
 			.sort(); // Sort files alphabetically for consistent ordering
 
 		// Reverse the order if requested
-		if (reverse) {
+		if (isReverse) {
 			imageFiles = imageFiles.reverse();
 		}
 
@@ -59,19 +67,18 @@ function getImageFiles(directory, reverse = false) {
 	}
 }
 
-async function createVideo(imageDirectory, fps, outputFile, reverse = false) {
-	const imageFiles = getImageFiles(imageDirectory, reverse);
+async function createVideo(imageDirectory, fps, outputFile, isReverse = false) {
+	const imageFiles = getImageFiles(imageDirectory, isReverse);
 
 	if (imageFiles.length === 0) {
 		console.error('No image files found in the specified directory.');
 		process.exit(1);
 	}
 
-	console.log(`Found ${imageFiles.length} image files in ${imageDirectory}`);
-	if (reverse) {
+	if (isReverse) {
 		console.log('Frame order: REVERSED');
 	}
-	console.log('First few files:', imageFiles.slice(0, 5));
+	console.log('First few files:', imageFiles.slice(0, 4));
 
 	// Use the image2 demuxer approach - create symbolic links or rename files temporarily
 	console.log('Creating video from image sequence...');

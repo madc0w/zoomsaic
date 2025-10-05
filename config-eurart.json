@@ -1,0 +1,9 @@
+{
+	"sourceImage": "\\\\TINYTIM\\Quaffle\\Multimedia\\pics\\Photos\\pics 2025-07-31 Milwaukee, nyc, birthdays\\20250719_095646.jpg",
+	"tilesDir": "\\\\TINYTIM\\Quaffle\\Multimedia\\Misc\\European art",
+	"outputFilename": "zoomsaic-eurart",
+	"maxNonuniqueTiles": 8,
+	"randomZoomMotion": 0.002,
+	"zoomSteps": 52,
+	"zoomFactor": 0.08
+}
