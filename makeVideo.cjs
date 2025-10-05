@@ -67,7 +67,14 @@ function getImageFiles(directory, isReverse = false) {
 	}
 }
 
-async function createVideo(imageDirectory, fps, outputFile, isReverse = false) {
+async function createVideo(
+	imageDirectory,
+	fps,
+	outputFile,
+	isReverse = false,
+	audioFile = null,
+	fadeOutSec = 0
+) {
 	const imageFiles = getImageFiles(imageDirectory, isReverse);
 
 	if (imageFiles.length === 0) {
@@ -103,9 +110,24 @@ async function createVideo(imageDirectory, fps, outputFile, isReverse = false) {
 		`Created ${imageFiles.length} sequential frames in temp directory`
 	);
 
-	// Use image2 demuxer with sequential pattern
+	// Compute video duration and use image2 demuxer with sequential pattern
+	const videoDuration = imageFiles.length / fps;
 	const pattern = path.join(tempDir, 'frame_%06d.png').replace(/\\/g, '/');
-	const ffmpegCommand = `ffmpeg -y -framerate ${fps} -i "${pattern}" -c:v libx264 -pix_fmt yuv420p "${outputFile}"`;
+	// Build ffmpeg command with optional audio input
+	let ffmpegCommand = `ffmpeg -y -framerate ${fps} -i "${pattern}"`;
+	if (audioFile) {
+		const st = Math.max(0, videoDuration - fadeOutSec);
+		ffmpegCommand += ` -i "${audioFile}" -map 0:v:0 -map 1:a:0`;
+		if (fadeOutSec > 0) {
+			ffmpegCommand += ` -filter:a "afade=t=out:st=${st.toFixed(
+				3
+			)}:d=${fadeOutSec.toFixed(3)}"`;
+		}
+		ffmpegCommand += ` -c:a aac -b:a 192k`;
+	}
+	ffmpegCommand += ` -t ${videoDuration.toFixed(
+		3
+	)} -c:v libx264 -pix_fmt yuv420p "${outputFile}"`;
 
 	const startTime = new Date();
 	console.log(`${startTime.toISOString()} : Running:`, ffmpegCommand);
@@ -144,7 +166,9 @@ async function createVideoWithNodeJS(
 	imageDirectory,
 	imageFiles,
 	fps,
-	outputFile
+	outputFile,
+	audioFile = null,
+	fadeOutSec = 0
 ) {
 	console.log('Attempting to create video using Node.js approach...');
 
@@ -152,7 +176,14 @@ async function createVideoWithNodeJS(
 		console.log('Creating an image sequence batch file for FFmpeg...');
 
 		// Create a batch file that can be run when FFmpeg is available
-		const batchContent = createFFmpegBatchFile(imageDirectory, fps, outputFile);
+		const batchContent = createFFmpegBatchFile(
+			imageDirectory,
+			fps,
+			outputFile,
+			audioFile,
+			imageFiles.length / fps,
+			fadeOutSec
+		);
 		const batchFile = outputFile.replace('.mp4', '_create_video.bat');
 
 		fs.writeFileSync(batchFile, batchContent);
@@ -169,7 +200,10 @@ async function createVideoWithNodeJS(
 		const psContent = createFFmpegPowerShellScript(
 			imageDirectory,
 			fps,
-			outputFile
+			outputFile,
+			audioFile,
+			imageFiles.length / fps,
+			fadeOutSec
 		);
 		const psFile = outputFile.replace('.mp4', '_create_video.ps1');
 
@@ -182,7 +216,14 @@ async function createVideoWithNodeJS(
 		console.error('Node.js approach failed:', error.message);
 		console.log('Creating manual scripts for when FFmpeg is available...');
 
-		const batchContent = createFFmpegBatchFile(imageDirectory, fps, outputFile);
+		const batchContent = createFFmpegBatchFile(
+			imageDirectory,
+			fps,
+			outputFile,
+			audioFile,
+			imageFiles.length / fps,
+			fadeOutSec
+		);
 		const batchFile = outputFile.replace('.mp4', '_create_video.bat');
 
 		fs.writeFileSync(batchFile, batchContent);
@@ -190,7 +231,27 @@ async function createVideoWithNodeJS(
 	}
 }
 
-function createFFmpegBatchFile(imageDirectory, fps, outputFile) {
+function createFFmpegBatchFile(
+	imageDirectory,
+	fps,
+	outputFile,
+	audioFile = null,
+	videoDuration = null,
+	fadeOutSec = 0
+) {
+	const hasDur = videoDuration != null && !isNaN(videoDuration);
+	const st = hasDur ? Math.max(0, videoDuration - fadeOutSec) : 0;
+	const durArg = hasDur ? ` -t ${videoDuration.toFixed(3)}` : '';
+	const audioArgs = audioFile
+		? ` -i "${audioFile}" -map 0:v:0 -map 1:a:0${
+				fadeOutSec > 0 && hasDur
+					? ` -filter:a "afade=t=out:st=${st.toFixed(3)}:d=${fadeOutSec.toFixed(
+							3
+					  )}"
+                  `
+					: ''
+		  } -c:a aac -b:a 192k`
+		: '';
 	return `@echo off
 echo Creating video from images in ${imageDirectory}
 echo Frame rate: ${fps} FPS
@@ -198,12 +259,12 @@ echo Output: ${outputFile}
 echo.
 
 REM Try glob pattern first
-ffmpeg -y -framerate ${fps} -pattern_type glob -i "${imageDirectory}\\*.png" -c:v libx264 -pix_fmt yuv420p "${outputFile}"
+ffmpeg -y -framerate ${fps} -pattern_type glob -i "${imageDirectory}\\*.png"${audioArgs}${durArg} -c:v libx264 -pix_fmt yuv420p "${outputFile}"
 
 REM If that fails, try with file list
 if %errorlevel% neq 0 (
     echo Glob pattern failed, trying file list approach...
-    ffmpeg -y -f concat -safe 0 -r ${fps} -i "${imageDirectory}\\file_list.txt" -c:v libx264 -pix_fmt yuv420p "${outputFile}"
+	ffmpeg -y -f concat -safe 0 -r ${fps} -i "${imageDirectory}\\file_list.txt"${audioArgs}${durArg} -c:v libx264 -pix_fmt yuv420p "${outputFile}"
 )
 
 if %errorlevel% equ 0 (
@@ -217,7 +278,27 @@ if %errorlevel% equ 0 (
 pause`;
 }
 
-function createFFmpegPowerShellScript(imageDirectory, fps, outputFile) {
+function createFFmpegPowerShellScript(
+	imageDirectory,
+	fps,
+	outputFile,
+	audioFile = null,
+	videoDuration = null,
+	fadeOutSec = 0
+) {
+	const hasDur = videoDuration != null && !isNaN(videoDuration);
+	const st = hasDur ? Math.max(0, videoDuration - fadeOutSec) : 0;
+	const durArg = hasDur ? ` -t ${videoDuration.toFixed(3)}` : '';
+	const audioArgs = audioFile
+		? ` -i "${audioFile}" -map 0:v:0 -map 1:a:0${
+				fadeOutSec > 0 && hasDur
+					? ` -filter:a "afade=t=out:st=${st.toFixed(3)}:d=${fadeOutSec.toFixed(
+							3
+					  )}"
+				  `
+					: ''
+		  } -c:a aac -b:a 192k`
+		: '';
 	return `# PowerShell script to create video from images
 Write-Host "Creating video from images in ${imageDirectory}"
 Write-Host "Frame rate: ${fps} FPS"
@@ -225,11 +306,11 @@ Write-Host "Output: ${outputFile}"
 Write-Host ""
 
 # Try glob pattern first
-$result = & ffmpeg -y -framerate ${fps} -pattern_type glob -i "${imageDirectory}\\*.png" -c:v libx264 -pix_fmt yuv420p "${outputFile}" 2>&1
+$result = & ffmpeg -y -framerate ${fps} -pattern_type glob -i "${imageDirectory}\\*.png"${audioArgs}${durArg} -c:v libx264 -pix_fmt yuv420p "${outputFile}" 2>&1
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Glob pattern failed, trying file list approach..."
-    & ffmpeg -y -f concat -safe 0 -r ${fps} -i "${imageDirectory}\\file_list.txt" -c:v libx264 -pix_fmt yuv420p "${outputFile}"
+	& ffmpeg -y -f concat -safe 0 -r ${fps} -i "${imageDirectory}\\file_list.txt"${audioArgs}${durArg} -c:v libx264 -pix_fmt yuv420p "${outputFile}"
 }
 
 if ($LASTEXITCODE -eq 0) {
@@ -252,7 +333,14 @@ function createFileListForManualUse(imageDirectory, imageFiles, outputFile) {
 	console.log(`Created file list: ${fileListPath}`);
 }
 
-function createVideoWithFileList(imageDirectory, imageFiles, fps, outputFile) {
+function createVideoWithFileList(
+	imageDirectory,
+	imageFiles,
+	fps,
+	outputFile,
+	audioFile = null,
+	fadeOutSec = 0
+) {
 	// For image sequences, we need to use a different approach
 	// Check if images have a consistent naming pattern
 	const firstFile = imageFiles[0];
@@ -271,15 +359,36 @@ function createVideoWithFileList(imageDirectory, imageFiles, fps, outputFile) {
 		console.log(
 			'Detected sequential numbering pattern, using image2 demuxer...'
 		);
-		createVideoWithPattern(imageDirectory, imageFiles, fps, outputFile);
+		createVideoWithPattern(
+			imageDirectory,
+			imageFiles,
+			fps,
+			outputFile,
+			audioFile,
+			fadeOutSec
+		);
 	} else {
 		// Use concat demuxer with individual image durations
 		console.log('Using concat demuxer with individual image frames...');
-		createVideoWithConcatImages(imageDirectory, imageFiles, fps, outputFile);
+		createVideoWithConcatImages(
+			imageDirectory,
+			imageFiles,
+			fps,
+			outputFile,
+			audioFile,
+			fadeOutSec
+		);
 	}
 }
 
-function createVideoWithPattern(imageDirectory, imageFiles, fps, outputFile) {
+function createVideoWithPattern(
+	imageDirectory,
+	imageFiles,
+	fps,
+	outputFile,
+	audioFile = null,
+	fadeOutSec = 0
+) {
 	// Try to create a pattern from the first file
 	const firstFile = imageFiles[0];
 	const pattern = firstFile.replace(/\d+/, '%04d'); // Assume 4-digit padding
@@ -292,7 +401,21 @@ function createVideoWithPattern(imageDirectory, imageFiles, fps, outputFile) {
 	console.log(`Using pattern: ${inputPattern}`);
 
 	// Use image2 demuxer for sequential images
-	const ffmpegCommand = `ffmpeg -y -framerate ${fps} -i "${inputPattern}" -c:v libx264 -pix_fmt yuv420p "${outputFile}"`;
+	const videoDuration = imageFiles.length / fps;
+	let ffmpegCommand = `ffmpeg -y -framerate ${fps} -i "${inputPattern}"`;
+	if (audioFile) {
+		const st = Math.max(0, videoDuration - fadeOutSec);
+		ffmpegCommand += ` -i "${audioFile}" -map 0:v:0 -map 1:a:0`;
+		if (fadeOutSec > 0) {
+			ffmpegCommand += ` -filter:a "afade=t=out:st=${st.toFixed(
+				3
+			)}:d=${fadeOutSec.toFixed(3)}"`;
+		}
+		ffmpegCommand += ` -c:a aac -b:a 192k`;
+	}
+	ffmpegCommand += ` -t ${videoDuration.toFixed(
+		3
+	)} -c:v libx264 -pix_fmt yuv420p "${outputFile}"`;
 
 	console.log('Running FFmpeg command:');
 	console.log(ffmpegCommand);
@@ -301,7 +424,14 @@ function createVideoWithPattern(imageDirectory, imageFiles, fps, outputFile) {
 		if (error) {
 			console.error('Pattern approach failed:', error.message);
 			console.log('Falling back to concat approach...');
-			createVideoWithConcatImages(imageDirectory, imageFiles, fps, outputFile);
+			createVideoWithConcatImages(
+				imageDirectory,
+				imageFiles,
+				fps,
+				outputFile,
+				audioFile,
+				fadeOutSec
+			);
 			return;
 		}
 
@@ -321,7 +451,9 @@ function createVideoWithConcatImages(
 	imageDirectory,
 	imageFiles,
 	fps,
-	outputFile
+	outputFile,
+	audioFile = null,
+	fadeOutSec = 0
 ) {
 	// Create a temporary file list for FFmpeg with durations
 	const fileListPath = path.join(imageDirectory, 'temp_file_list.txt');
@@ -351,7 +483,21 @@ function createVideoWithConcatImages(
 	console.log(fileListContent.split('\n').slice(0, 4).join('\n'));
 
 	// FFmpeg command using concat demuxer with durations
-	const ffmpegCommand = `ffmpeg -y -f concat -safe 0 -i "${fileListPath}" -c:v libx264 -pix_fmt yuv420p "${outputFile}"`;
+	const videoDuration = imageFiles.length / fps;
+	let ffmpegCommand = `ffmpeg -y -f concat -safe 0 -i "${fileListPath}"`;
+	if (audioFile) {
+		const st = Math.max(0, videoDuration - fadeOutSec);
+		ffmpegCommand += ` -i "${audioFile}" -map 0:v:0 -map 1:a:0`;
+		if (fadeOutSec > 0) {
+			ffmpegCommand += ` -filter:a "afade=t=out:st=${st.toFixed(
+				3
+			)}:d=${fadeOutSec.toFixed(3)}"`;
+		}
+		ffmpegCommand += ` -c:a aac -b:a 192k`;
+	}
+	ffmpegCommand += ` -t ${videoDuration.toFixed(
+		3
+	)} -c:v libx264 -pix_fmt yuv420p "${outputFile}"`;
 
 	console.log('Running FFmpeg command:');
 	console.log(ffmpegCommand);
@@ -372,7 +518,9 @@ function createVideoWithConcatImages(
 				imageDirectory,
 				getImageFiles(imageDirectory),
 				fps,
-				outputFile
+				outputFile,
+				audioFile,
+				fadeOutSec
 			);
 			return;
 		}
@@ -391,7 +539,7 @@ function createVideoWithConcatImages(
 
 function showUsage() {
 	console.log(
-		'Usage: node makeVideo.cjs <image_directory> <fps> [output_file] [--reverse]'
+		'Usage: node makeVideo.cjs <image_directory> <fps> [output_file] [--reverse] [--audio <file>|-a <file>] [--fade-out <sec>]'
 	);
 	console.log('');
 	console.log('Arguments:');
@@ -403,11 +551,20 @@ function showUsage() {
 	console.log('');
 	console.log('Options:');
 	console.log('  --reverse       Reverse the order of frames in the video');
+	console.log(
+		'  --audio, -a     Path to an audio file (mp3 or wav) to mux into the video'
+	);
+	console.log(
+		'  --fade-out      Audio fade-out duration in seconds (optional)'
+	);
 	console.log('');
 	console.log('Examples:');
 	console.log('  node makeVideo.cjs ./images 30');
 	console.log('  node makeVideo.cjs C:\\path\\to\\images 24 my_video.mp4');
 	console.log('  node makeVideo.cjs ./images 30 output.mp4 --reverse');
+	console.log('  node makeVideo.cjs ./images 30 output.mp4 --audio music.mp3');
+	console.log('  node makeVideo.cjs ./images 30 -a sound.wav');
+	console.log('  node makeVideo.cjs ./images 30 -a music.mp3 --fade-out 2.5');
 	console.log('  node makeVideo.cjs ./images 30 --reverse');
 	console.log('');
 	console.log('Supported image formats: JPG, JPEG, PNG, BMP, TIFF, GIF');
@@ -416,15 +573,52 @@ function showUsage() {
 // Parse command line arguments
 const args = process.argv.slice(2);
 
-if (args.length < 2) {
+// Check for flags
+let reverseFlag = false;
+let audioFile = null;
+let fadeOutSec = 0;
+
+// Parse flags while preserving positional args
+const filteredArgs = [];
+for (let i = 0; i < args.length; i++) {
+	const arg = args[i];
+	if (arg === '--reverse') {
+		reverseFlag = true;
+	} else if (arg === '--audio' || arg === '-a') {
+		const next = args[i + 1];
+		if (!next || next.startsWith('-')) {
+			console.error('Error: --audio|-a requires a file path argument.');
+			showUsage();
+			process.exit(1);
+		}
+		audioFile = next;
+		i++; // skip next
+	} else if (arg === '--fade-out' || arg === '--fade') {
+		const next = args[i + 1];
+		if (!next || next.startsWith('-')) {
+			console.error(
+				'Error: --fade-out requires a numeric duration in seconds.'
+			);
+			showUsage();
+			process.exit(1);
+		}
+		const val = parseFloat(next);
+		if (isNaN(val) || val < 0) {
+			console.error('Error: --fade-out must be a number >= 0.');
+			process.exit(1);
+		}
+		fadeOutSec = val;
+		i++; // skip next
+	} else {
+		filteredArgs.push(arg);
+	}
+}
+
+if (filteredArgs.length < 2) {
 	console.error('Error: Missing required arguments.');
 	showUsage();
 	process.exit(1);
 }
-
-// Check for --reverse flag
-const reverseFlag = args.includes('--reverse');
-const filteredArgs = args.filter((arg) => arg !== '--reverse');
 
 const imageDirectory = filteredArgs[0];
 const fps = parseFloat(filteredArgs[1]);
@@ -446,18 +640,45 @@ if (isNaN(fps) || fps <= 0) {
 	process.exit(1);
 }
 
+// Validate audio file if provided
+if (audioFile) {
+	if (!fs.existsSync(audioFile)) {
+		console.error(`Error: Audio file "${audioFile}" does not exist.`);
+		process.exit(1);
+	}
+	const ext = path.extname(audioFile).toLowerCase();
+	const allowed = ['.mp3', '.wav'];
+	if (!allowed.includes(ext)) {
+		console.error('Error: Audio file must be .mp3 or .wav');
+		process.exit(1);
+	}
+}
+
 console.log(`Creating video from images in: ${imageDirectory}`);
 console.log(`Frame rate: ${fps} FPS`);
 console.log(`Output file: ${outputFile}`);
 if (reverseFlag) {
 	console.log('Frame order: REVERSED');
 }
+if (audioFile) {
+	console.log(`Audio file: ${audioFile}`);
+}
+if (fadeOutSec > 0) {
+	console.log(`Audio fade-out: ${fadeOutSec}s`);
+}
 console.log('');
 
 // Create the video
 (async () => {
 	try {
-		await createVideo(imageDirectory, fps, outputFile, reverseFlag);
+		await createVideo(
+			imageDirectory,
+			fps,
+			outputFile,
+			reverseFlag,
+			audioFile,
+			fadeOutSec
+		);
 	} catch (error) {
 		console.error('Error:', error.message);
 		process.exit(1);

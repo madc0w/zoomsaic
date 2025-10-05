@@ -111,6 +111,11 @@ function clamp(x, lo, hi) {
 	return Math.max(lo, Math.min(hi, x));
 }
 
+function clampByte(v) {
+	// Fast clamp to 0..255 for channel math
+	return v < 0 ? 0 : v > 255 ? 255 : v | 0;
+}
+
 // ---- Simple 3D KD-Tree for nearest color lookup ----
 function buildKdTree(points, depth = 0) {
 	if (!points || points.length === 0) return null;
@@ -206,9 +211,12 @@ async function composeFrameFromPattern({
 			for (let x = 0; x < cropW; x++) {
 				const t = srcRow[cropLeft + x];
 				const off = (y * cropW + x) * 3;
-				pix[off] = t.r;
-				pix[off + 1] = t.g;
-				pix[off + 2] = t.b;
+				const dr = (t && t.dr) || 0;
+				const dg = (t && t.dg) || 0;
+				const db = (t && t.db) || 0;
+				pix[off] = clampByte(((t && t.r) || 0) + dr);
+				pix[off + 1] = clampByte(((t && t.g) || 0) + dg);
+				pix[off + 2] = clampByte(((t && t.b) || 0) + db);
 			}
 		}
 		await sharp(pix, { raw: { width: cropW, height: cropH, channels: 3 } })
@@ -281,11 +289,16 @@ async function composeFrameFromPattern({
 
 	for (let tyIndex = visY0; tyIndex <= visY1; tyIndex++) {
 		const row = pattern[tyIndex];
+		const rowSlice = row.slice(visX0, visX1 + 1);
 		const bufs = await Promise.all(
-			row.slice(visX0, visX1 + 1).map((t) => getTileBuf(t.path || t))
+			rowSlice.map((t) => getTileBuf(t.path || t))
 		);
 		for (let ix = visX0; ix <= visX1; ix++) {
 			const tile = bufs[ix - visX0];
+			const tMeta = row[ix];
+			const dr = (tMeta && tMeta.dr) || 0;
+			const dg = (tMeta && tMeta.dg) || 0;
+			const db = (tMeta && tMeta.db) || 0;
 			// Tile bounds in full image pixels
 			const tileLeft = ix * tileSize;
 			const tileTop = tyIndex * tileSize;
@@ -309,8 +322,13 @@ async function composeFrameFromPattern({
 			for (let rowY = 0; rowY < regionH; rowY++) {
 				const srcRowOff = ((srcY + rowY) * tileSize + srcX) * 3;
 				const dstRowOff = ((dstY + rowY) * cropW + dstX) * 3;
-				const bytes = regionW * 3;
-				tile.copy(buffer, dstRowOff, srcRowOff, srcRowOff + bytes);
+				for (let px = 0; px < regionW; px++) {
+					const s = srcRowOff + px * 3;
+					const d = dstRowOff + px * 3;
+					buffer[d] = clampByte(tile[s] + dr);
+					buffer[d + 1] = clampByte(tile[s + 1] + dg);
+					buffer[d + 2] = clampByte(tile[s + 2] + db);
+				}
 			}
 			doneTiles++;
 		}
@@ -413,13 +431,22 @@ async function computeIterationPattern({
 			if (usage) {
 				usage.set(best.path, (usage.get(best.path) || 0) + 1);
 			}
-			pattern[y][x] = best;
+			// Store tile choice along with per-cell color adjustment to better
+			// match the source mean color at this grid cell during compositing.
+			pattern[y][x] = {
+				path: best.path,
+				r: best.r,
+				g: best.g,
+				b: best.b,
+				dr: (color.r | 0) - (best.r | 0),
+				dg: (color.g | 0) - (best.g | 0),
+				db: (color.b | 0) - (best.b | 0),
+			};
 		}
 
-		if ((y + 1) % 4 === 0 || y === mosaicH - 1) {
+		{
 			const pct = ((y + 1) / mosaicH) * 100;
 			const elapsed = Date.now() - t0;
-			// Track timing for the last 8 iterations for better projection accuracy
 			if (!computeIterationPattern.timings) {
 				computeIterationPattern.timings = [];
 			}
@@ -428,7 +455,7 @@ async function computeIterationPattern({
 			let projectedTotal;
 			if (timings.length >= 2) {
 				// Calculate average time per row from recent iterations
-				const recentTimings = timings.slice(-8); // Last 8 iterations
+				const recentTimings = timings.slice(-2); // Last 2 iterations
 				const avgTimePerRow =
 					recentTimings.reduce((sum, time) => sum + time, 0) /
 					recentTimings.length;
@@ -443,8 +470,8 @@ async function computeIterationPattern({
 			// Store timing for this iteration when complete
 			if (y === mosaicH - 1) {
 				timings.push(elapsed / mosaicH); // time per row
-				while (timings.length > 8) {
-					timings.shift(); // Keep only last 8
+				while (timings.length > 2) {
+					timings.shift(); // Keep only last 2
 				}
 			}
 			process.stdout.write(
@@ -454,7 +481,9 @@ async function computeIterationPattern({
 					1
 				)} minutes, projected end: ${projectedEndDate.toISOString()}`
 			);
-			if (y === mosaicH - 1) process.stdout.write('\n');
+			if (y === mosaicH - 1) {
+				process.stdout.write('\n');
+			}
 		}
 	}
 	return { pattern, mosaicW, mosaicH };
@@ -802,7 +831,15 @@ async function generateFrame({
 			if (!best) best = nearestInKdTree(kdTree, color).point;
 
 			if (usage) usage.set(best.path, (usage.get(best.path) || 0) + 1);
-			selected[y][x] = best;
+			selected[y][x] = {
+				path: best.path,
+				r: best.r,
+				g: best.g,
+				b: best.b,
+				dr: (color.r | 0) - (best.r | 0),
+				dg: (color.g | 0) - (best.g | 0),
+				db: (color.b | 0) - (best.b | 0),
+			};
 		}
 		if ((y + 1) % 10 === 0 || y === mosaicH - 1) {
 			const pct = Math.round(((y + 1) / mosaicH) * 100);
@@ -821,9 +858,12 @@ async function generateFrame({
 			for (let x = 0; x < mosaicW; x++) {
 				const t = selected[y][x];
 				const off = (y * mosaicW + x) * 3;
-				pix[off] = t.r;
-				pix[off + 1] = t.g;
-				pix[off + 2] = t.b;
+				const dr = (t && t.dr) || 0;
+				const dg = (t && t.dg) || 0;
+				const db = (t && t.db) || 0;
+				pix[off] = clampByte(((t && t.r) || 0) + dr);
+				pix[off + 1] = clampByte(((t && t.g) || 0) + dg);
+				pix[off + 2] = clampByte(((t && t.b) || 0) + db);
 			}
 		}
 		await sharp(pix, { raw: { width: mosaicW, height: mosaicH, channels: 3 } })
@@ -869,11 +909,21 @@ async function generateFrame({
 		const bufs = await Promise.all(row.map((t) => getTileBuf(t.path)));
 		for (let x = 0; x < mosaicW; x++) {
 			const tile = bufs[x];
+			const tMeta = row[x];
+			const dr = (tMeta && tMeta.dr) || 0;
+			const dg = (tMeta && tMeta.dg) || 0;
+			const db = (tMeta && tMeta.db) || 0;
 			const startX = x * tileSize;
 			for (let ty = 0; ty < tileSize; ty++) {
 				const srcRow = ty * tileSize * 3;
 				const dstRow = rowStart + (ty * actualW + startX) * 3;
-				tile.copy(frameBuf, dstRow, srcRow, srcRow + tileSize * 3);
+				for (let px = 0; px < tileSize; px++) {
+					const s = srcRow + px * 3;
+					const d = dstRow + px * 3;
+					frameBuf[d] = clampByte(tile[s] + dr);
+					frameBuf[d + 1] = clampByte(tile[s + 1] + dg);
+					frameBuf[d + 2] = clampByte(tile[s + 2] + db);
+				}
 			}
 		}
 		if ((y + 1) % 5 === 0 || y === mosaicH - 1) {
@@ -938,7 +988,7 @@ async function main() {
 	let globalFrame = 1;
 	let currentSource = sourceImage;
 	let iteration = 1;
-	for (;;) {
+	while (true) {
 		console.log(
 			`[iteration ${iteration}] ${new Date().toISOString()} : start; source: ${currentSource}`
 		);
@@ -953,12 +1003,16 @@ async function main() {
 			centerX,
 			centerY,
 		});
+		if (currentSource !== sourceImage) {
+			// Remove previous iteration's temp source image
+			try {
+				await fs.unlink(currentSource);
+			} catch (_) {}
+		}
 
-		for (let step = 1; step <= zoomSteps; step++, globalFrame++) {
-			if (globalFrame % zoomSteps === 0) {
-				// skip frame to avoid duplicate mosaic'd and unmosaic'd frames
-				continue;
-			}
+		// Track the last actually generated frame this iteration
+		let lastFramePath = null;
+		for (let step = 1; step <= zoomSteps; step++) {
 			const framePath = `${outputBaseNoExt}_${pad4(globalFrame)}.png`;
 			console.log(
 				`[frame ${globalFrame} (iter ${iteration}, step ${step}/${zoomSteps})] -> ${framePath}`
@@ -988,9 +1042,12 @@ async function main() {
 			});
 			const secs = Math.round((Date.now() - t0) / 1000);
 			console.log(`[frame ${globalFrame}] done in ${secs}s`);
-			if (step === zoomSteps) {
-				currentSource = framePath;
-			}
+			lastFramePath = framePath;
+			globalFrame++;
+		}
+		// Carry the last generated frame forward as the next iteration's source image
+		if (lastFramePath) {
+			currentSource = lastFramePath;
 		}
 		iteration++;
 	}

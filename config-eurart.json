@@ -1,9 +1,9 @@
 {
-	"sourceImage": "\\\\TINYTIM\\Quaffle\\Multimedia\\pics\\Photos\\pics 2025-07-31 Milwaukee, nyc, birthdays\\20250719_095646.jpg",
+	"sourceImage": "\\\\TINYTIM\\Quaffle\\Multimedia\\Misc\\European art\\B\\BOSCH, Hieronymus (ca. 1450, 's-Hertogenbosch - 1516, 's-Hertogenbosch)\\BOSCH, Hieronymus - The Seven Deadly Sins.jpg",
 	"tilesDir": "\\\\TINYTIM\\Quaffle\\Multimedia\\Misc\\European art",
 	"outputFilename": "zoomsaic-eurart",
 	"maxNonuniqueTiles": 8,
-	"randomZoomMotion": 0.002,
+	"randomZoomMotion": 0.004,
 	"zoomSteps": 52,
 	"zoomFactor": 0.08
 }
