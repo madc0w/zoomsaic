@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
 
-const framesPerIteration = 48;
+// const zoomSteps = 48;
 
 // // Check if FFmpeg is available
 // function checkFFmpegAvailability() {
@@ -46,10 +46,10 @@ function getImageFiles(directory, isReverse = false) {
 			.filter((file) => {
 				const ext = path.extname(file).toLowerCase();
 				if (supportedExtensions.includes(ext)) {
-					if (framesPerIteration) {
-						const n = file.match(/_(\d{4})\.png$/)[1];
-						return parseInt(n) % framesPerIteration !== 0;
-					}
+					// if (zoomSteps) {
+					// 	const n = file.match(/_(\d{4})\.png$/)[1];
+					// 	return parseInt(n) % zoomSteps !== 0;
+					// }
 					return true;
 				}
 			})

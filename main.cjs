@@ -933,7 +933,7 @@ async function main() {
 
 	let centerX = 0.5,
 		centerY = 0.5;
-	const motion = Number(config.randomZoomMotion) || 0;
+	const zoomMotion = Number(config.randomZoomMotion) || 0;
 
 	let globalFrame = 1;
 	let currentSource = sourceImage;
@@ -955,18 +955,22 @@ async function main() {
 		});
 
 		for (let step = 1; step <= zoomSteps; step++, globalFrame++) {
+			if (globalFrame % zoomSteps === 0) {
+				// skip frame to avoid duplicate mosaic'd and unmosaic'd frames
+				continue;
+			}
 			const framePath = `${outputBaseNoExt}_${pad4(globalFrame)}.png`;
 			console.log(
 				`[frame ${globalFrame} (iter ${iteration}, step ${step}/${zoomSteps})] -> ${framePath}`
 			);
 			const t0 = Date.now();
-			if (motion > 0 && globalFrame > 1) {
+			if (zoomMotion > 0 && globalFrame > 1) {
 				// Make motion absolute w.r.t. output by scaling by inverse zoom
 				const stepScale = Math.max(1, Math.pow(zf, step - 1));
-				const jx = (randn() * motion) / stepScale;
-				const jy = (randn() * motion) / stepScale;
-				centerX = clamp(centerX + jx, 0.2, 0.8);
-				centerY = clamp(centerY + jy, 0.2, 0.8);
+				centerX += (randn() * zoomMotion) / stepScale;
+				centerY += (randn() * zoomMotion) / stepScale;
+				centerX = clamp(centerX, 0.2, 0.8);
+				centerY = clamp(centerY, 0.2, 0.8);
 			}
 			const tileSize = Math.max(1, Math.ceil(Math.pow(zf, step - 1)));
 			const zoomScale = Math.max(1, Math.pow(zf, step - 1));

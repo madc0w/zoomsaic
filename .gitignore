@@ -2,3 +2,5 @@ node_modules
 zoom-*/*
 zoomsaic-*/*
 .tile_cache
+*.mp4
+*.png
