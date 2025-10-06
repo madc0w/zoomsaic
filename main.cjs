@@ -116,6 +116,53 @@ function clampByte(v) {
 	return v < 0 ? 0 : v > 255 ? 255 : v | 0;
 }
 
+// ---- Robust atomic write helpers to avoid transient Windows file write errors ----
+async function sleep(ms) {
+	return new Promise((r) => setTimeout(r, ms));
+}
+
+async function safeWriteFileAtomic(filePath, data, retries = 3) {
+	const dir = path.dirname(filePath);
+	const base = path.basename(filePath);
+	const tmp = path.join(
+		dir,
+		`.${base}.${crypto.randomBytes(6).toString('hex')}.tmp`
+	);
+	let lastErr;
+	for (let i = 0; i < retries; i++) {
+		try {
+			await fs.writeFile(tmp, data);
+			await fs.rename(tmp, filePath);
+			return;
+		} catch (e) {
+			lastErr = e;
+			try {
+				await fs.unlink(tmp);
+			} catch (_) {}
+			// Small backoff before retry
+			await sleep(200 * (i + 1));
+		}
+	}
+	throw lastErr;
+}
+
+async function writeResizedPngAtomic(
+	rawBuffer,
+	rawWidth,
+	rawHeight,
+	outW,
+	outH,
+	outputPath
+) {
+	const pipeline = sharp(rawBuffer, {
+		raw: { width: rawWidth, height: rawHeight, channels: 3 },
+	})
+		.resize(outW, outH)
+		.png();
+	const pngBuf = await pipeline.toBuffer();
+	await safeWriteFileAtomic(outputPath, pngBuf, 4);
+}
+
 // ---- Simple 3D KD-Tree for nearest color lookup ----
 function buildKdTree(points, depth = 0) {
 	if (!points || points.length === 0) return null;
@@ -175,7 +222,7 @@ function nearestAllowedInKdTree(
 
 // Compose a frame from a fixed pattern (tile paths), using a given tileSize.
 async function composeFrameFromPattern({
-	pattern, // 2D array of tile objects or paths
+	pattern, // 2D array of tile metadata
 	mosaicW,
 	mosaicH,
 	tileSize,
@@ -185,13 +232,13 @@ async function composeFrameFromPattern({
 	centerX = 0.5,
 	centerY = 0.5,
 	zoomScale = 1,
+	colorAdjustStrength = 1,
 }) {
 	const fullW = mosaicW * tileSize;
 	const fullH = mosaicH * tileSize;
 
-	// Fast path for 1px tiles: emit only the visible RGB region without composing full image
+	// Fast path for 1px tiles: compute crop in tile-grid units and emit adjusted means
 	if (tileSize === 1) {
-		// Compute crop in tile-grid units
 		const cropW = Math.max(
 			1,
 			Math.min(mosaicW, Math.round(mosaicW / Math.max(1, zoomScale)))
@@ -211,18 +258,22 @@ async function composeFrameFromPattern({
 			for (let x = 0; x < cropW; x++) {
 				const t = srcRow[cropLeft + x];
 				const off = (y * cropW + x) * 3;
-				const dr = (t && t.dr) || 0;
-				const dg = (t && t.dg) || 0;
-				const db = (t && t.db) || 0;
-				pix[off] = clampByte(((t && t.r) || 0) + dr);
-				pix[off + 1] = clampByte(((t && t.g) || 0) + dg);
-				pix[off + 2] = clampByte(((t && t.b) || 0) + db);
+				const drS = Math.round(((t && t.dr) || 0) * colorAdjustStrength);
+				const dgS = Math.round(((t && t.dg) || 0) * colorAdjustStrength);
+				const dbS = Math.round(((t && t.db) || 0) * colorAdjustStrength);
+				pix[off] = clampByte(((t && t.r) || 0) + drS);
+				pix[off + 1] = clampByte(((t && t.g) || 0) + dgS);
+				pix[off + 2] = clampByte(((t && t.b) || 0) + dbS);
 			}
 		}
-		await sharp(pix, { raw: { width: cropW, height: cropH, channels: 3 } })
-			.resize(outputWidth, outputHeight)
-			.png()
-			.toFile(outputPath);
+		await writeResizedPngAtomic(
+			pix,
+			cropW,
+			cropH,
+			outputWidth,
+			outputHeight,
+			outputPath
+		);
 		return;
 	}
 
@@ -243,6 +294,7 @@ async function composeFrameFromPattern({
 	// Allocate only the cropped output buffer
 	const buffer = Buffer.alloc(cropW * cropH * 3);
 
+	// Per-size cache for resized tile buffers
 	const memCache = new Map();
 	async function getTileBuf(p) {
 		const key = `${p}|${tileSize}`;
@@ -258,7 +310,6 @@ async function composeFrameFromPattern({
 				.toBuffer();
 			const expected = tileSize * tileSize * 3;
 			if (buf.length !== expected) {
-				// Force RGB 3-channel output as a fallback
 				buf = await sharp(p)
 					.resize(tileSize, tileSize)
 					.removeAlpha()
@@ -296,9 +347,10 @@ async function composeFrameFromPattern({
 		for (let ix = visX0; ix <= visX1; ix++) {
 			const tile = bufs[ix - visX0];
 			const tMeta = row[ix];
-			const dr = (tMeta && tMeta.dr) || 0;
-			const dg = (tMeta && tMeta.dg) || 0;
-			const db = (tMeta && tMeta.db) || 0;
+			const drS = Math.round(((tMeta && tMeta.dr) || 0) * colorAdjustStrength);
+			const dgS = Math.round(((tMeta && tMeta.dg) || 0) * colorAdjustStrength);
+			const dbS = Math.round(((tMeta && tMeta.db) || 0) * colorAdjustStrength);
+
 			// Tile bounds in full image pixels
 			const tileLeft = ix * tileSize;
 			const tileTop = tyIndex * tileSize;
@@ -325,9 +377,9 @@ async function composeFrameFromPattern({
 				for (let px = 0; px < regionW; px++) {
 					const s = srcRowOff + px * 3;
 					const d = dstRowOff + px * 3;
-					buffer[d] = clampByte(tile[s] + dr);
-					buffer[d + 1] = clampByte(tile[s + 1] + dg);
-					buffer[d + 2] = clampByte(tile[s + 2] + db);
+					buffer[d] = clampByte(tile[s] + drS);
+					buffer[d + 1] = clampByte(tile[s + 1] + dgS);
+					buffer[d + 2] = clampByte(tile[s + 2] + dbS);
 				}
 			}
 			doneTiles++;
@@ -339,10 +391,14 @@ async function composeFrameFromPattern({
 		}
 	}
 
-	await sharp(buffer, { raw: { width: cropW, height: cropH, channels: 3 } })
-		.resize(outputWidth, outputHeight)
-		.png()
-		.toFile(outputPath);
+	await writeResizedPngAtomic(
+		buffer,
+		cropW,
+		cropH,
+		outputWidth,
+		outputHeight,
+		outputPath
+	);
 }
 
 // Compute the tile selection pattern once for an iteration (enforces maxNonuniqueTiles)
@@ -446,41 +502,42 @@ async function computeIterationPattern({
 
 		{
 			const pct = ((y + 1) / mosaicH) * 100;
-			const elapsed = Date.now() - t0;
-			if (!computeIterationPattern.timings) {
-				computeIterationPattern.timings = [];
-			}
-			const timings = computeIterationPattern.timings;
+			// const elapsed = Date.now() - t0;
+			// if (!computeIterationPattern.timings) {
+			// 	computeIterationPattern.timings = [];
+			// }
+			// const timings = computeIterationPattern.timings;
 
-			let projectedTotal;
-			if (timings.length >= 2) {
-				// Calculate average time per row from recent iterations
-				const recentTimings = timings.slice(-2); // Last 2 iterations
-				const avgTimePerRow =
-					recentTimings.reduce((sum, time) => sum + time, 0) /
-					recentTimings.length;
-				projectedTotal = avgTimePerRow * mosaicH;
-			} else {
-				// Fallback to original calculation for first few iterations
-				projectedTotal = elapsed * (mosaicH / (y + 1));
-			}
-			const projectedDuration = (projectedTotal - elapsed) / 60000;
-			const projectedEndDate = new Date(Date.now() + projectedTotal - elapsed);
+			// let projectedTotal;
+			// if (timings.length >= 2) {
+			// 	// Calculate average time per row from recent iterations
+			// 	const recentTimings = timings.slice(-2); // Last 2 iterations
+			// 	const avgTimePerRow =
+			// 		recentTimings.reduce((sum, time) => sum + time, 0) /
+			// 		recentTimings.length;
+			// 	projectedTotal = avgTimePerRow * mosaicH;
+			// } else {
+			// 	// Fallback to original calculation for first few iterations
+			// 	projectedTotal = elapsed * (mosaicH / (y + 1));
+			// }
+			// const projectedDuration = (projectedTotal - elapsed) / 60000;
+			// const projectedEndDate = new Date(Date.now() + projectedTotal - elapsed);
 
-			// Store timing for this iteration when complete
-			if (y === mosaicH - 1) {
-				timings.push(elapsed / mosaicH); // time per row
-				while (timings.length > 2) {
-					timings.shift(); // Keep only last 2
-				}
-			}
-			process.stdout.write(
-				`\r[layout iteration] ${pct.toFixed(
-					2
-				)}%  projected duration: ${projectedDuration.toFixed(
-					1
-				)} minutes, projected end: ${projectedEndDate.toISOString()}`
-			);
+			// // Store timing for this iteration when complete
+			// if (y === mosaicH - 1) {
+			// 	timings.push(elapsed / mosaicH); // time per row
+			// 	while (timings.length > 2) {
+			// 		timings.shift(); // Keep only last 2
+			// 	}
+			// }
+			process.stdout.write(`\r[layout iteration] ${pct.toFixed(2)}%`);
+			// process.stdout.write(
+			// 	`\r[layout iteration] ${pct.toFixed(
+			// 		2
+			// 	)}%  projected duration: ${projectedDuration.toFixed(
+			// 		1
+			// 	)} minutes, projected end: ${projectedEndDate.toISOString()}`
+			// );
 			if (y === mosaicH - 1) {
 				process.stdout.write('\n');
 			}
@@ -762,6 +819,7 @@ async function generateFrame({
 	outputPath,
 	centerX = 0.5,
 	centerY = 0.5,
+	colorAdjustStrength = 1,
 }) {
 	// tile size for this frame (reset progression per iteration)
 	const tileSize = Math.max(
@@ -861,15 +919,22 @@ async function generateFrame({
 				const dr = (t && t.dr) || 0;
 				const dg = (t && t.dg) || 0;
 				const db = (t && t.db) || 0;
-				pix[off] = clampByte(((t && t.r) || 0) + dr);
-				pix[off + 1] = clampByte(((t && t.g) || 0) + dg);
-				pix[off + 2] = clampByte(((t && t.b) || 0) + db);
+				const drS = Math.round(dr * colorAdjustStrength);
+				const dgS = Math.round(dg * colorAdjustStrength);
+				const dbS = Math.round(db * colorAdjustStrength);
+				pix[off] = clampByte(((t && t.r) || 0) + drS);
+				pix[off + 1] = clampByte(((t && t.g) || 0) + dgS);
+				pix[off + 2] = clampByte(((t && t.b) || 0) + dbS);
 			}
 		}
-		await sharp(pix, { raw: { width: mosaicW, height: mosaicH, channels: 3 } })
-			.resize(outputWidth, outputHeight)
-			.png()
-			.toFile(outputPath);
+		await writeResizedPngAtomic(
+			pix,
+			mosaicW,
+			mosaicH,
+			outputWidth,
+			outputHeight,
+			outputPath
+		);
 		return;
 	}
 
@@ -920,9 +985,12 @@ async function generateFrame({
 				for (let px = 0; px < tileSize; px++) {
 					const s = srcRow + px * 3;
 					const d = dstRow + px * 3;
-					frameBuf[d] = clampByte(tile[s] + dr);
-					frameBuf[d + 1] = clampByte(tile[s + 1] + dg);
-					frameBuf[d + 2] = clampByte(tile[s + 2] + db);
+					const drS = Math.round(dr * colorAdjustStrength);
+					const dgS = Math.round(dg * colorAdjustStrength);
+					const dbS = Math.round(db * colorAdjustStrength);
+					frameBuf[d] = clampByte(tile[s] + drS);
+					frameBuf[d + 1] = clampByte(tile[s + 1] + dgS);
+					frameBuf[d + 2] = clampByte(tile[s + 2] + dbS);
 				}
 			}
 		}
@@ -936,12 +1004,14 @@ async function generateFrame({
 	}
 
 	// Resize to exact output dims (minor scale/crop difference possible)
-	await sharp(frameBuf, {
-		raw: { width: actualW, height: actualH, channels: 3 },
-	})
-		.resize(outputWidth, outputHeight)
-		.png()
-		.toFile(outputPath);
+	await writeResizedPngAtomic(
+		frameBuf,
+		actualW,
+		actualH,
+		outputWidth,
+		outputHeight,
+		outputPath
+	);
 }
 
 async function main() {
@@ -973,6 +1043,13 @@ async function main() {
 	// Determine final output height based on source aspect
 	const meta = await sharp(sourceImage).metadata();
 	const outputHeight = Math.round(outputWidth * (meta.height / meta.width));
+
+	// Color adjustment strength (0..1)
+	let colorAdjustStrength = Number(config.colorAdjustStrength);
+	if (!isFinite(colorAdjustStrength)) {
+		colorAdjustStrength = 1;
+	}
+	colorAdjustStrength = Math.max(0, Math.min(1, colorAdjustStrength));
 
 	// Infinite iterations: each iteration renders zoomSteps frames,
 	// then uses the last frame as the next iteration's source image.
@@ -1039,6 +1116,7 @@ async function main() {
 				centerX,
 				centerY,
 				zoomScale,
+				colorAdjustStrength,
 			});
 			const secs = Math.round((Date.now() - t0) / 1000);
 			console.log(`[frame ${globalFrame}] done in ${secs}s`);
