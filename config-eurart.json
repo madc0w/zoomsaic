@@ -3,8 +3,10 @@
 	"tilesDir": "\\\\TINYTIM\\Quaffle\\Multimedia\\Misc\\European art",
 	"outputFilename": "zoomsaic-eurart",
 	"maxNonuniqueTiles": 8,
-	"randomZoomMotion": 0.004,
+	"randomZoomMotion": 0,
 	"zoomSteps": 52,
 	"zoomFactor": 0.08,
+	"zoomMotionRadius": 0.25,
+	"zoomMotionRadiansPerFrame": 0.04,
 	"colorAdjustStrength": 0.4
 }

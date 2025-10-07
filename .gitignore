@@ -4,3 +4,4 @@ zoomsaic-*/*
 .tile_cache
 *.mp4
 *.png
+*.part

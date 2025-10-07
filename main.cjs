@@ -229,13 +229,45 @@ async function composeFrameFromPattern({
 	outputWidth,
 	outputHeight,
 	outputPath,
-	centerX = 0.5,
-	centerY = 0.5,
+	center = { x: 0.5, y: 0.5 },
 	zoomScale = 1,
 	colorAdjustStrength = 1,
 }) {
 	const fullW = mosaicW * tileSize;
 	const fullH = mosaicH * tileSize;
+
+	// Helper to draw a small filled circle (orange dot) at (cx, cy)
+	function drawDot(
+		buf,
+		w,
+		h,
+		cx,
+		cy,
+		radius = 3,
+		color = { r: 255, g: 128, b: 0 }
+	) {
+		// Clamp center
+		cx = Math.max(0, Math.min(w - 1, Math.round(cx)));
+		cy = Math.max(0, Math.min(h - 1, Math.round(cy)));
+		const r2 = radius * radius;
+		const xMin = Math.max(0, cx - radius);
+		const xMax = Math.min(w - 1, cx + radius);
+		const yMin = Math.max(0, cy - radius);
+		const yMax = Math.min(h - 1, cy + radius);
+		for (let y = yMin; y <= yMax; y++) {
+			const dy = y - cy;
+			const dy2 = dy * dy;
+			for (let x = xMin; x <= xMax; x++) {
+				const dx = x - cx;
+				if (dx * dx + dy2 <= r2) {
+					const off = (y * w + x) * 3;
+					buf[off] = color.r;
+					buf[off + 1] = color.g;
+					buf[off + 2] = color.b;
+				}
+			}
+		}
+	}
 
 	// Fast path for 1px tiles: compute crop in tile-grid units and emit adjusted means
 	if (tileSize === 1) {
@@ -247,8 +279,8 @@ async function composeFrameFromPattern({
 			1,
 			Math.min(mosaicH, Math.round(mosaicH / Math.max(1, zoomScale)))
 		);
-		const desiredLeft = Math.round(centerX * mosaicW - cropW / 2);
-		const desiredTop = Math.round(centerY * mosaicH - cropH / 2);
+		const desiredLeft = Math.round(center.x * mosaicW - cropW / 2);
+		const desiredTop = Math.round(center.y * mosaicH - cropH / 2);
 		const cropLeft = Math.max(0, Math.min(mosaicW - cropW, desiredLeft));
 		const cropTop = Math.max(0, Math.min(mosaicH - cropH, desiredTop));
 
@@ -266,6 +298,10 @@ async function composeFrameFromPattern({
 				pix[off + 2] = clampByte(((t && t.b) || 0) + dbS);
 			}
 		}
+		// Draw an orange debug dot at the zoom center
+		const cxCrop = center.x * mosaicW - cropLeft;
+		const cyCrop = center.y * mosaicH - cropTop;
+		drawDot(pix, cropW, cropH, cxCrop, cyCrop, 3);
 		await writeResizedPngAtomic(
 			pix,
 			cropW,
@@ -286,8 +322,8 @@ async function composeFrameFromPattern({
 		1,
 		Math.min(fullH, Math.round(fullH / Math.max(1, zoomScale)))
 	);
-	const desiredLeft = Math.round(centerX * fullW - cropW / 2);
-	const desiredTop = Math.round(centerY * fullH - cropH / 2);
+	const desiredLeft = Math.round(center.x * fullW - cropW / 2);
+	const desiredTop = Math.round(center.y * fullH - cropH / 2);
 	const cropLeft = Math.max(0, Math.min(fullW - cropW, desiredLeft));
 	const cropTop = Math.max(0, Math.min(fullH - cropH, desiredTop));
 
@@ -391,6 +427,11 @@ async function composeFrameFromPattern({
 		}
 	}
 
+	// Draw an orange debug dot at the zoom center in crop pixel space
+	const cxCropPx = center.x * fullW - cropLeft;
+	const cyCropPx = center.y * fullH - cropTop;
+	drawDot(buffer, cropW, cropH, cxCropPx, cyCropPx, 3);
+
 	await writeResizedPngAtomic(
 		buffer,
 		cropW,
@@ -409,8 +450,7 @@ async function computeIterationPattern({
 	tiles,
 	kdTree,
 	maxNonuniqueTiles,
-	centerX,
-	centerY,
+	center,
 	layoutTileSize = 2, // base tile size for layout grid
 }) {
 	// Build the layout on a coarser grid to keep usage caps feasible and fast
@@ -427,8 +467,8 @@ async function computeIterationPattern({
 	const srcMeta = await sharp(sourceImage).metadata();
 	const srcW = srcMeta.width,
 		srcH = srcMeta.height;
-	const cx = Math.round(srcW * centerX),
-		cy = Math.round(srcH * centerY);
+	const cx = Math.round(srcW * center.x),
+		cy = Math.round(srcH * center.y);
 	// With scale=1 (no zoom), crop is full source but we still center if bounds allow
 	const left = Math.max(0, Math.min(srcW - srcW, cx - Math.round(srcW / 2)));
 	const top = Math.max(0, Math.min(srcH - srcH, cy - Math.round(srcH / 2)));
@@ -806,213 +846,212 @@ function pad4(n) {
 }
 
 // Generate a single frame by re-mosaicing the zoomed crop of the source
-async function generateFrame({
-	frameIndex, // for logging only (global running index)
-	stepInIteration = frameIndex, // 1..zoomSteps controls tile sizing
-	sourceImage,
-	outputWidth,
-	outputHeight,
-	zoomFactor,
-	tiles,
-	kdTree,
-	maxNonuniqueTiles = 0,
-	outputPath,
-	centerX = 0.5,
-	centerY = 0.5,
-	colorAdjustStrength = 1,
-}) {
-	// tile size for this frame (reset progression per iteration)
-	const tileSize = Math.max(
-		1,
-		Math.ceil(Math.pow(zoomFactor, stepInIteration - 1))
-	);
+// async function generateFrame({
+// 	frameIndex, // for logging only (global running index)
+// 	stepInIteration = frameIndex, // 1..zoomSteps controls tile sizing
+// 	sourceImage,
+// 	outputWidth,
+// 	outputHeight,
+// 	zoomFactor,
+// 	tiles,
+// 	kdTree,
+// 	maxNonuniqueTiles = 0,
+// 	outputPath,
+// 	center = { x: 0.5, y: 0.5 },
+// 	colorAdjustStrength = 1,
+// }) {
+// 	// tile size for this frame (reset progression per iteration)
+// 	const tileSize = Math.max(
+// 		1,
+// 		Math.ceil(Math.pow(zoomFactor, stepInIteration - 1))
+// 	);
 
-	// number of tiles in the output grid
-	const mosaicW = Math.max(1, Math.round(outputWidth / tileSize));
-	const mosaicH = Math.max(1, Math.round(outputHeight / tileSize));
+// 	// number of tiles in the output grid
+// 	const mosaicW = Math.max(1, Math.round(outputWidth / tileSize));
+// 	const mosaicH = Math.max(1, Math.round(outputHeight / tileSize));
 
-	// Determine crop on the original source to create the zoom effect
-	const srcMeta = await sharp(sourceImage).metadata();
-	const srcW = srcMeta.width,
-		srcH = srcMeta.height;
-	const scale = Math.max(1, Math.pow(zoomFactor, stepInIteration - 1));
-	const cropW = Math.max(1, Math.round(srcW / scale));
-	const cropH = Math.max(1, Math.round(srcH / scale));
-	const cx = Math.round(srcW * centerX),
-		cy = Math.round(srcH * centerY);
-	const left = Math.max(0, Math.min(srcW - cropW, cx - Math.round(cropW / 2)));
-	const top = Math.max(0, Math.min(srcH - cropH, cy - Math.round(cropH / 2)));
+// 	// Determine crop on the original source to create the zoom effect
+// 	const srcMeta = await sharp(sourceImage).metadata();
+// 	const srcW = srcMeta.width,
+// 		srcH = srcMeta.height;
+// 	const scale = Math.max(1, Math.pow(zoomFactor, stepInIteration - 1));
+// 	const cropW = Math.max(1, Math.round(srcW / scale));
+// 	const cropH = Math.max(1, Math.round(srcH / scale));
+// 	const cx = Math.round(srcW * center.x),
+// 		cy = Math.round(srcH * center.y);
+// 	const left = Math.max(0, Math.min(srcW - cropW, cx - Math.round(cropW / 2)));
+// 	const top = Math.max(0, Math.min(srcH - cropH, cy - Math.round(cropH / 2)));
 
-	// Get analysis image for this frame: resize the crop to the mosaic grid
-	const { data: analysis } = await sharp(sourceImage)
-		.extract({ left, top, width: cropW, height: cropH })
-		.resize(mosaicW, mosaicH)
-		.removeAlpha()
-		.raw()
-		.toBuffer({ resolveWithObject: true });
+// 	// Get analysis image for this frame: resize the crop to the mosaic grid
+// 	const { data: analysis } = await sharp(sourceImage)
+// 		.extract({ left, top, width: cropW, height: cropH })
+// 		.resize(mosaicW, mosaicH)
+// 		.removeAlpha()
+// 		.raw()
+// 		.toBuffer({ resolveWithObject: true });
 
-	// Select tiles per cell using KD-tree (fast)
-	const usage = maxNonuniqueTiles > 0 ? new Map() : null;
-	const selected = new Array(mosaicH);
-	for (let y = 0; y < mosaicH; y++) {
-		selected[y] = new Array(mosaicW);
-		for (let x = 0; x < mosaicW; x++) {
-			const idx = (y * mosaicW + x) * 3;
-			const color = {
-				r: analysis[idx],
-				g: analysis[idx + 1],
-				b: analysis[idx + 2],
-			};
+// 	// Select tiles per cell using KD-tree (fast)
+// 	const usage = maxNonuniqueTiles > 0 ? new Map() : null;
+// 	const selected = new Array(mosaicH);
+// 	for (let y = 0; y < mosaicH; y++) {
+// 		selected[y] = new Array(mosaicW);
+// 		for (let x = 0; x < mosaicW; x++) {
+// 			const idx = (y * mosaicW + x) * 3;
+// 			const color = {
+// 				r: analysis[idx],
+// 				g: analysis[idx + 1],
+// 				b: analysis[idx + 2],
+// 			};
 
-			// Avoid adjacency with left/top neighbors
-			const leftPath = x > 0 ? selected[y][x - 1]?.path : null;
-			const topPath = y > 0 ? selected[y - 1][x]?.path : null;
-			const withinCap = (t) =>
-				!usage ? true : (usage.get(t.path) || 0) < maxNonuniqueTiles;
-			const isAllowedAdj = (t) =>
-				withinCap(t) && t.path !== leftPath && t.path !== topPath;
+// 			// Avoid adjacency with left/top neighbors
+// 			const leftPath = x > 0 ? selected[y][x - 1]?.path : null;
+// 			const topPath = y > 0 ? selected[y - 1][x]?.path : null;
+// 			const withinCap = (t) =>
+// 				!usage ? true : (usage.get(t.path) || 0) < maxNonuniqueTiles;
+// 			const isAllowedAdj = (t) =>
+// 				withinCap(t) && t.path !== leftPath && t.path !== topPath;
 
-			let node = nearestAllowedInKdTree(kdTree, color, isAllowedAdj);
-			let best = node.point;
-			if (!best) {
-				const leftOnly = (t) => withinCap(t) && t.path !== topPath;
-				const topOnly = (t) => withinCap(t) && t.path !== leftPath;
-				const cand1 = nearestAllowedInKdTree(kdTree, color, leftOnly).point;
-				const cand2 = nearestAllowedInKdTree(kdTree, color, topOnly).point;
-				if (cand1 && cand2) {
-					best = distSq(color, cand1) <= distSq(color, cand2) ? cand1 : cand2;
-				} else {
-					best = cand1 || cand2;
-				}
-			}
-			if (!best) best = nearestAllowedInKdTree(kdTree, color, withinCap).point;
-			if (!best) best = nearestInKdTree(kdTree, color).point;
+// 			let node = nearestAllowedInKdTree(kdTree, color, isAllowedAdj);
+// 			let best = node.point;
+// 			if (!best) {
+// 				const leftOnly = (t) => withinCap(t) && t.path !== topPath;
+// 				const topOnly = (t) => withinCap(t) && t.path !== leftPath;
+// 				const cand1 = nearestAllowedInKdTree(kdTree, color, leftOnly).point;
+// 				const cand2 = nearestAllowedInKdTree(kdTree, color, topOnly).point;
+// 				if (cand1 && cand2) {
+// 					best = distSq(color, cand1) <= distSq(color, cand2) ? cand1 : cand2;
+// 				} else {
+// 					best = cand1 || cand2;
+// 				}
+// 			}
+// 			if (!best) best = nearestAllowedInKdTree(kdTree, color, withinCap).point;
+// 			if (!best) best = nearestInKdTree(kdTree, color).point;
 
-			if (usage) usage.set(best.path, (usage.get(best.path) || 0) + 1);
-			selected[y][x] = {
-				path: best.path,
-				r: best.r,
-				g: best.g,
-				b: best.b,
-				dr: (color.r | 0) - (best.r | 0),
-				dg: (color.g | 0) - (best.g | 0),
-				db: (color.b | 0) - (best.b | 0),
-			};
-		}
-		if ((y + 1) % 10 === 0 || y === mosaicH - 1) {
-			const pct = Math.round(((y + 1) / mosaicH) * 100);
-			process.stdout.write(
-				`\r[selecting frame: ${frameIndex} tile size: ${tileSize}px] ${pct}%`
-			);
-			if (y === mosaicH - 1) process.stdout.write('\n');
-		}
-	}
+// 			if (usage) usage.set(best.path, (usage.get(best.path) || 0) + 1);
+// 			selected[y][x] = {
+// 				path: best.path,
+// 				r: best.r,
+// 				g: best.g,
+// 				b: best.b,
+// 				dr: (color.r | 0) - (best.r | 0),
+// 				dg: (color.g | 0) - (best.g | 0),
+// 				db: (color.b | 0) - (best.b | 0),
+// 			};
+// 		}
+// 		if ((y + 1) % 10 === 0 || y === mosaicH - 1) {
+// 			const pct = Math.round(((y + 1) / mosaicH) * 100);
+// 			process.stdout.write(
+// 				`\r[selecting frame: ${frameIndex} tile size: ${tileSize}px] ${pct}%`
+// 			);
+// 			if (y === mosaicH - 1) process.stdout.write('\n');
+// 		}
+// 	}
 
-	// Compose the frame
-	if (tileSize === 1) {
-		// Fast path: fill pixels directly with the chosen tile average colors
-		const pix = Buffer.alloc(mosaicW * mosaicH * 3);
-		for (let y = 0; y < mosaicH; y++) {
-			for (let x = 0; x < mosaicW; x++) {
-				const t = selected[y][x];
-				const off = (y * mosaicW + x) * 3;
-				const dr = (t && t.dr) || 0;
-				const dg = (t && t.dg) || 0;
-				const db = (t && t.db) || 0;
-				const drS = Math.round(dr * colorAdjustStrength);
-				const dgS = Math.round(dg * colorAdjustStrength);
-				const dbS = Math.round(db * colorAdjustStrength);
-				pix[off] = clampByte(((t && t.r) || 0) + drS);
-				pix[off + 1] = clampByte(((t && t.g) || 0) + dgS);
-				pix[off + 2] = clampByte(((t && t.b) || 0) + dbS);
-			}
-		}
-		await writeResizedPngAtomic(
-			pix,
-			mosaicW,
-			mosaicH,
-			outputWidth,
-			outputHeight,
-			outputPath
-		);
-		return;
-	}
+// 	// Compose the frame
+// 	if (tileSize === 1) {
+// 		// Fast path: fill pixels directly with the chosen tile average colors
+// 		const pix = Buffer.alloc(mosaicW * mosaicH * 3);
+// 		for (let y = 0; y < mosaicH; y++) {
+// 			for (let x = 0; x < mosaicW; x++) {
+// 				const t = selected[y][x];
+// 				const off = (y * mosaicW + x) * 3;
+// 				const dr = (t && t.dr) || 0;
+// 				const dg = (t && t.dg) || 0;
+// 				const db = (t && t.db) || 0;
+// 				const drS = Math.round(dr * colorAdjustStrength);
+// 				const dgS = Math.round(dg * colorAdjustStrength);
+// 				const dbS = Math.round(db * colorAdjustStrength);
+// 				pix[off] = clampByte(((t && t.r) || 0) + drS);
+// 				pix[off + 1] = clampByte(((t && t.g) || 0) + dgS);
+// 				pix[off + 2] = clampByte(((t && t.b) || 0) + dbS);
+// 			}
+// 		}
+// 		await writeResizedPngAtomic(
+// 			pix,
+// 			mosaicW,
+// 			mosaicH,
+// 			outputWidth,
+// 			outputHeight,
+// 			outputPath
+// 		);
+// 		return;
+// 	}
 
-	const actualW = mosaicW * tileSize;
-	const actualH = mosaicH * tileSize;
-	const frameBuf = Buffer.alloc(actualW * actualH * 3);
-	// Per-size cache of tile buffers (and disk cache usage)
-	const memCache = new Map();
-	async function getTileBuf(p) {
-		const key = `${p}|${tileSize}`;
-		let buf = memCache.get(key);
-		if (buf) return buf;
-		buf = await readTileCacheBuffer(p, tileSize);
-		if (!buf) {
-			buf = await sharp(p)
-				.resize(tileSize, tileSize)
-				.removeAlpha()
-				.raw()
-				.toBuffer();
-			const expected = tileSize * tileSize * 3;
-			if (buf.length !== expected) {
-				buf = await sharp(p)
-					.resize(tileSize, tileSize)
-					.removeAlpha()
-					.raw()
-					.toBuffer();
-			}
-			writeTileCacheBuffer(p, tileSize, buf).catch(() => {});
-		}
-		memCache.set(key, buf);
-		return buf;
-	}
+// 	const actualW = mosaicW * tileSize;
+// 	const actualH = mosaicH * tileSize;
+// 	const frameBuf = Buffer.alloc(actualW * actualH * 3);
+// 	// Per-size cache of tile buffers (and disk cache usage)
+// 	const memCache = new Map();
+// 	async function getTileBuf(p) {
+// 		const key = `${p}|${tileSize}`;
+// 		let buf = memCache.get(key);
+// 		if (buf) return buf;
+// 		buf = await readTileCacheBuffer(p, tileSize);
+// 		if (!buf) {
+// 			buf = await sharp(p)
+// 				.resize(tileSize, tileSize)
+// 				.removeAlpha()
+// 				.raw()
+// 				.toBuffer();
+// 			const expected = tileSize * tileSize * 3;
+// 			if (buf.length !== expected) {
+// 				buf = await sharp(p)
+// 					.resize(tileSize, tileSize)
+// 					.removeAlpha()
+// 					.raw()
+// 					.toBuffer();
+// 			}
+// 			writeTileCacheBuffer(p, tileSize, buf).catch(() => {});
+// 		}
+// 		memCache.set(key, buf);
+// 		return buf;
+// 	}
 
-	for (let y = 0; y < mosaicH; y++) {
-		const row = selected[y];
-		const rowStart = y * tileSize * actualW * 3;
-		const bufs = await Promise.all(row.map((t) => getTileBuf(t.path)));
-		for (let x = 0; x < mosaicW; x++) {
-			const tile = bufs[x];
-			const tMeta = row[x];
-			const dr = (tMeta && tMeta.dr) || 0;
-			const dg = (tMeta && tMeta.dg) || 0;
-			const db = (tMeta && tMeta.db) || 0;
-			const startX = x * tileSize;
-			for (let ty = 0; ty < tileSize; ty++) {
-				const srcRow = ty * tileSize * 3;
-				const dstRow = rowStart + (ty * actualW + startX) * 3;
-				for (let px = 0; px < tileSize; px++) {
-					const s = srcRow + px * 3;
-					const d = dstRow + px * 3;
-					const drS = Math.round(dr * colorAdjustStrength);
-					const dgS = Math.round(dg * colorAdjustStrength);
-					const dbS = Math.round(db * colorAdjustStrength);
-					frameBuf[d] = clampByte(tile[s] + drS);
-					frameBuf[d + 1] = clampByte(tile[s + 1] + dgS);
-					frameBuf[d + 2] = clampByte(tile[s + 2] + dbS);
-				}
-			}
-		}
-		if ((y + 1) % 5 === 0 || y === mosaicH - 1) {
-			const pct = Math.round(((y + 1) / mosaicH) * 100);
-			process.stdout.write(
-				`\r[composing frame: ${frameIndex} tile size: ${tileSize}px] ${pct}%`
-			);
-			if (y === mosaicH - 1) process.stdout.write('\n');
-		}
-	}
+// 	for (let y = 0; y < mosaicH; y++) {
+// 		const row = selected[y];
+// 		const rowStart = y * tileSize * actualW * 3;
+// 		const bufs = await Promise.all(row.map((t) => getTileBuf(t.path)));
+// 		for (let x = 0; x < mosaicW; x++) {
+// 			const tile = bufs[x];
+// 			const tMeta = row[x];
+// 			const dr = (tMeta && tMeta.dr) || 0;
+// 			const dg = (tMeta && tMeta.dg) || 0;
+// 			const db = (tMeta && tMeta.db) || 0;
+// 			const startX = x * tileSize;
+// 			for (let ty = 0; ty < tileSize; ty++) {
+// 				const srcRow = ty * tileSize * 3;
+// 				const dstRow = rowStart + (ty * actualW + startX) * 3;
+// 				for (let px = 0; px < tileSize; px++) {
+// 					const s = srcRow + px * 3;
+// 					const d = dstRow + px * 3;
+// 					const drS = Math.round(dr * colorAdjustStrength);
+// 					const dgS = Math.round(dg * colorAdjustStrength);
+// 					const dbS = Math.round(db * colorAdjustStrength);
+// 					frameBuf[d] = clampByte(tile[s] + drS);
+// 					frameBuf[d + 1] = clampByte(tile[s + 1] + dgS);
+// 					frameBuf[d + 2] = clampByte(tile[s + 2] + dbS);
+// 				}
+// 			}
+// 		}
+// 		if ((y + 1) % 5 === 0 || y === mosaicH - 1) {
+// 			const pct = Math.round(((y + 1) / mosaicH) * 100);
+// 			process.stdout.write(
+// 				`\r[composing frame: ${frameIndex} tile size: ${tileSize}px] ${pct}%`
+// 			);
+// 			if (y === mosaicH - 1) process.stdout.write('\n');
+// 		}
+// 	}
 
-	// Resize to exact output dims (minor scale/crop difference possible)
-	await writeResizedPngAtomic(
-		frameBuf,
-		actualW,
-		actualH,
-		outputWidth,
-		outputHeight,
-		outputPath
-	);
-}
+// 	// Resize to exact output dims (minor scale/crop difference possible)
+// 	await writeResizedPngAtomic(
+// 		frameBuf,
+// 		actualW,
+// 		actualH,
+// 		outputWidth,
+// 		outputHeight,
+// 		outputPath
+// 	);
+// }
 
 async function main() {
 	const { json: config, absPath } = await readConfig();
@@ -1058,9 +1097,20 @@ async function main() {
 	let zf = zoomFactor;
 	if (!isFinite(zf) || zf <= 1) zf = 1.1;
 
-	let centerX = 0.5,
-		centerY = 0.5;
+	const center = { x: 0.5, y: 0.5 };
+	// Track previous and last centers so we can roll back on failures
+	let prevCenter = { x: center.x, y: center.y };
+	let lastCenter = { x: center.x, y: center.y };
 	const zoomMotion = Number(config.randomZoomMotion) || 0;
+	const zoomMotionRadius = Number(config.zoomMotionRadius) || 0;
+	const zoomMotionRadiansPerFrame =
+		Number(config.zoomMotionRadiansPerFrame) || 0;
+
+	let orbitAngle = 0;
+
+	// Keep small random-walk jitter separate from orbital base
+	let jitterX = 0;
+	let jitterY = 0;
 
 	let globalFrame = 1;
 	let currentSource = sourceImage;
@@ -1077,14 +1127,23 @@ async function main() {
 			tiles,
 			kdTree,
 			maxNonuniqueTiles,
-			centerX,
-			centerY,
+			center,
 		});
 		if (currentSource !== sourceImage) {
 			// Remove previous iteration's temp source image
 			try {
 				await fs.unlink(currentSource);
-			} catch (_) {}
+			} catch (e) {
+				// If cleanup fails, roll back the zoom center to the previous value
+				console.warn(
+					`[cleanup] failed to delete ${currentSource}: ${
+						e && e.message ? e.message : e
+					}. Rolling back zoom center.`
+				);
+				center.x = prevCenter.x;
+				center.y = prevCenter.y;
+				lastCenter = { x: center.x, y: center.y };
+			}
 		}
 
 		// Track the last actually generated frame this iteration
@@ -1095,14 +1154,38 @@ async function main() {
 				`[frame ${globalFrame} (iter ${iteration}, step ${step}/${zoomSteps})] -> ${framePath}`
 			);
 			const t0 = Date.now();
-			if (zoomMotion > 0 && globalFrame > 1) {
-				// Make motion absolute w.r.t. output by scaling by inverse zoom
-				const stepScale = Math.max(1, Math.pow(zf, step - 1));
-				centerX += (randn() * zoomMotion) / stepScale;
-				centerY += (randn() * zoomMotion) / stepScale;
-				centerX = clamp(centerX, 0.2, 0.8);
-				centerY = clamp(centerY, 0.2, 0.8);
+			// Make motion absolute w.r.t. output by scaling by inverse zoom
+			const stepScale = Math.max(1, Math.pow(zf, step - 1));
+
+			// Update orbital center around (0.5, 0.5)
+			if (zoomMotionRadius > 0 && zoomMotionRadiansPerFrame !== 0) {
+				// Advance angle each frame
+				orbitAngle += zoomMotionRadiansPerFrame;
 			}
+			// Keep apparent orbit radius constant in output pixels across zoom
+			// If zoomMotionRadius > 1, treat it as pixels; else as fraction of output width
+			const orbitRadiusNorm =
+				(zoomMotionRadius > 1
+					? zoomMotionRadius / outputWidth
+					: zoomMotionRadius) / stepScale;
+			const baseX = 0.5 + orbitRadiusNorm * Math.cos(orbitAngle);
+			const baseY = 0.5 + orbitRadiusNorm * Math.sin(orbitAngle);
+
+			// Add optional small random-walk jitter around the orbital center
+			if (zoomMotion > 0 && globalFrame > 1) {
+				// Keep jitter amplitude constant in output pixels as well
+				const jitterNorm =
+					(zoomMotion > 1 ? zoomMotion / outputWidth : zoomMotion) / stepScale;
+				jitterX += randn() * jitterNorm;
+				jitterY += randn() * jitterNorm;
+			}
+
+			// Snapshot current center before updating so we can roll back if needed
+			prevCenter = { x: center.x, y: center.y };
+			// Allow full range; cropping logic will clamp within image bounds
+			center.x = clamp(baseX + jitterX, 0, 1);
+			center.y = clamp(baseY + jitterY, 0, 1);
+			lastCenter = { x: center.x, y: center.y };
 			const tileSize = Math.max(1, Math.ceil(Math.pow(zf, step - 1)));
 			const zoomScale = Math.max(1, Math.pow(zf, step - 1));
 			await composeFrameFromPattern({
@@ -1113,8 +1196,7 @@ async function main() {
 				outputWidth,
 				outputHeight,
 				outputPath: framePath,
-				centerX,
-				centerY,
+				center,
 				zoomScale,
 				colorAdjustStrength,
 			});
