@@ -24,26 +24,15 @@ process.on('unhandledRejection', (reason) => {
 	process.exit(1);
 });
 
-const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']);
+// ---- Defaults and basic helpers ----
+const DEFAULT_OUTPUT_WIDTH = 1280;
 
-const DEFAULT_OUTPUT_WIDTH = 1024;
-
-function isImage(file) {
-	const ext = path.extname(file || '').toLowerCase();
-	return IMAGE_EXTS.has(ext);
-}
-
-async function readConfig(
-	configPath = path.resolve(__dirname, process.argv[2] || 'config.json')
-) {
-	const absPath = path.resolve(configPath);
-	const raw = await fs.readFile(absPath, 'utf8');
-	const json = JSON.parse(raw);
-	return { json, absPath };
+function isImage(p) {
+	const ext = path.extname(p).toLowerCase();
+	return ['.png', '.jpg', '.jpeg', '.webp', '.bmp'].includes(ext);
 }
 
 async function* walkImages(dir) {
-	// Recursively yield image file paths
 	const entries = await fs.readdir(dir, { withFileTypes: true });
 	for (const entry of entries) {
 		const full = path.join(dir, entry.name);
@@ -61,10 +50,8 @@ async function* walkImages(dir) {
 	}
 }
 
-async function computeAvgColor(imgPath, size = 8) {
-	// Return { r, g, b, path }
+async function computeAvgColor(imgPath) {
 	const { data } = await sharp(imgPath)
-		.resize(size, size)
 		.removeAlpha()
 		.toColourspace('srgb')
 		.raw()
@@ -84,6 +71,43 @@ async function computeAvgColor(imgPath, size = 8) {
 		b: Math.round(b / pixels),
 		path: imgPath,
 	};
+}
+
+async function readConfig(explicitPath) {
+	// Determine config path in this order:
+	// 1) explicitPath argument
+	// 2) process.argv[2] (CLI argument)
+	// 3) default to config.json next to this script
+	const argPath = explicitPath || process.argv[2] || null;
+
+	// Build candidate paths to try (cwd first, then relative to script dir)
+	const candidates = [];
+	if (argPath) {
+		candidates.push(path.resolve(process.cwd(), argPath));
+		// If argPath is not absolute, also try relative to script directory
+		if (!path.isAbsolute(argPath)) {
+			candidates.push(path.resolve(__dirname, argPath));
+		}
+	}
+	// Always include default fallback
+	candidates.push(path.join(__dirname, 'config.json'));
+
+	let lastErr;
+	for (const p of candidates) {
+		try {
+			const text = await fs.readFile(p, 'utf8');
+			const json = JSON.parse(text);
+			return { json, absPath: p };
+		} catch (e) {
+			lastErr = e;
+		}
+	}
+	// If all candidates failed, throw a helpful error listing attempted paths
+	const tried = candidates.map((p) => `- ${p}`).join('\n');
+	const msg = `Unable to read config file. Tried:\n${tried}`;
+	const err = new Error(msg);
+	err.cause = lastErr;
+	throw err;
 }
 
 function distSq(a, b) {
@@ -232,42 +256,79 @@ async function composeFrameFromPattern({
 	center = { x: 0.5, y: 0.5 },
 	zoomScale = 1,
 	colorAdjustStrength = 1,
+	// debugDotOffsetPx = 0,
 }) {
 	const fullW = mosaicW * tileSize;
 	const fullH = mosaicH * tileSize;
 
-	// Helper to draw a small filled circle (orange dot) at (cx, cy)
-	function drawDot(
-		buf,
-		w,
-		h,
-		cx,
-		cy,
-		radius = 3,
-		color = { r: 255, g: 128, b: 0 }
-	) {
-		// Clamp center
-		cx = Math.max(0, Math.min(w - 1, Math.round(cx)));
-		cy = Math.max(0, Math.min(h - 1, Math.round(cy)));
-		const r2 = radius * radius;
-		const xMin = Math.max(0, cx - radius);
-		const xMax = Math.min(w - 1, cx + radius);
-		const yMin = Math.max(0, cy - radius);
-		const yMax = Math.min(h - 1, cy + radius);
-		for (let y = yMin; y <= yMax; y++) {
-			const dy = y - cy;
-			const dy2 = dy * dy;
-			for (let x = xMin; x <= xMax; x++) {
-				const dx = x - cx;
-				if (dx * dx + dy2 <= r2) {
-					const off = (y * w + x) * 3;
-					buf[off] = color.r;
-					buf[off + 1] = color.g;
-					buf[off + 2] = color.b;
-				}
-			}
-		}
-	}
+	// // Helper to draw a small filled circle (orange dot) at (cx, cy)
+	// function drawDot(
+	// 	buf,
+	// 	w,
+	// 	h,
+	// 	cx,
+	// 	cy,
+	// 	radius = 3,
+	// 	color = { r: 255, g: 128, b: 0 }
+	// ) {
+	// 	// Clamp/round center and draw filled circle
+	// 	cx = Math.max(0, Math.min(w - 1, Math.round(cx)));
+	// 	cy = Math.max(0, Math.min(h - 1, Math.round(cy)));
+	// 	const r2 = radius * radius;
+	// 	const xMin = Math.max(0, cx - radius);
+	// 	const xMax = Math.min(w - 1, cx + radius);
+	// 	const yMin = Math.max(0, cy - radius);
+	// 	const yMax = Math.min(h - 1, cy + radius);
+	// 	for (let y = yMin; y <= yMax; y++) {
+	// 		const dy = y - cy;
+	// 		const dy2 = dy * dy;
+	// 		for (let x = xMin; x <= xMax; x++) {
+	// 			const dx = x - cx;
+	// 			if (dx * dx + dy2 <= r2) {
+	// 				const off = (y * w + x) * 3;
+	// 				buf[off] = color.r;
+	// 				buf[off + 1] = color.g;
+	// 				buf[off + 2] = color.b;
+	// 			}
+	// 		}
+	// 	}
+	// }
+
+	// // Helper to draw a circle outline (white ring) around a point
+	// function drawRing(
+	// 	buf,
+	// 	w,
+	// 	h,
+	// 	cx,
+	// 	cy,
+	// 	radius = 6,
+	// 	thickness = 2,
+	// 	color = { r: 255, g: 255, b: 255 }
+	// ) {
+	// 	cx = Math.max(0, Math.min(w - 1, Math.round(cx)));
+	// 	cy = Math.max(0, Math.min(h - 1, Math.round(cy)));
+	// 	const rOuter2 = radius * radius;
+	// 	const rInner = Math.max(0, radius - Math.max(1, thickness));
+	// 	const rInner2 = rInner * rInner;
+	// 	const xMin = Math.max(0, cx - radius);
+	// 	const xMax = Math.min(w - 1, cx + radius);
+	// 	const yMin = Math.max(0, cy - radius);
+	// 	const yMax = Math.min(h - 1, cy + radius);
+	// 	for (let y = yMin; y <= yMax; y++) {
+	// 		const dy = y - cy;
+	// 		const dy2 = dy * dy;
+	// 		for (let x = xMin; x <= xMax; x++) {
+	// 			const dx = x - cx;
+	// 			const d2 = dx * dx + dy2;
+	// 			if (d2 <= rOuter2 && d2 >= rInner2) {
+	// 				const off = (y * w + x) * 3;
+	// 				buf[off] = color.r;
+	// 				buf[off + 1] = color.g;
+	// 				buf[off + 2] = color.b;
+	// 			}
+	// 		}
+	// 	}
+	// }
 
 	// Fast path for 1px tiles: compute crop in tile-grid units and emit adjusted means
 	if (tileSize === 1) {
@@ -279,6 +340,7 @@ async function composeFrameFromPattern({
 			1,
 			Math.min(mosaicH, Math.round(mosaicH / Math.max(1, zoomScale)))
 		);
+		// Center the crop on the requested zoom point (no extra visual offset)
 		const desiredLeft = Math.round(center.x * mosaicW - cropW / 2);
 		const desiredTop = Math.round(center.y * mosaicH - cropH / 2);
 		const cropLeft = Math.max(0, Math.min(mosaicW - cropW, desiredLeft));
@@ -298,10 +360,33 @@ async function composeFrameFromPattern({
 				pix[off + 2] = clampByte(((t && t.b) || 0) + dbS);
 			}
 		}
-		// Draw an orange debug dot at the zoom center
-		const cxCrop = center.x * mosaicW - cropLeft;
-		const cyCrop = center.y * mosaicH - cropTop;
-		drawDot(pix, cropW, cropH, cxCrop, cyCrop, 3);
+		// Draw an orange debug dot near the zoom center with a constant screen-space offset for visibility
+		// const cxCrop = Math.round(center.x * mosaicW) - cropLeft;
+		// const cyCrop = Math.round(center.y * mosaicH) - cropTop;
+		// let offX = 0,
+		// 	offY = 0;
+		// if (debugDotOffsetPx > 0) {
+		// 	const dirX = center.x - 0.5;
+		// 	const dirY = center.y - 0.5;
+		// 	const len = Math.hypot(dirX, dirY) || 1;
+		// 	const ux = dirX / len;
+		// 	const uy = dirY / len;
+		// 	const scale = (debugDotOffsetPx * cropW) / outputWidth;
+		// 	offX = ux * scale;
+		// 	offY = uy * scale;
+		// }
+		// drawDot(pix, cropW, cropH, cxCrop + offX, cyCrop + offY, 6);
+		// drawRing(pix, cropW, cropH, cxCrop + offX, cyCrop + offY, 10, 3);
+		// Larger blue dot at actual crop center for comparison
+		// drawDot(
+		// 	pix,
+		// 	cropW,
+		// 	cropH,
+		// 	Math.round(cropW / 2),
+		// 	Math.round(cropH / 2),
+		// 	5,
+		// 	{ r: 0, g: 180, b: 255 }
+		// );
 		await writeResizedPngAtomic(
 			pix,
 			cropW,
@@ -322,6 +407,7 @@ async function composeFrameFromPattern({
 		1,
 		Math.min(fullH, Math.round(fullH / Math.max(1, zoomScale)))
 	);
+	// Center the crop on the requested zoom point (no extra visual offset)
 	const desiredLeft = Math.round(center.x * fullW - cropW / 2);
 	const desiredTop = Math.round(center.y * fullH - cropH / 2);
 	const cropLeft = Math.max(0, Math.min(fullW - cropW, desiredLeft));
@@ -427,10 +513,37 @@ async function composeFrameFromPattern({
 		}
 	}
 
-	// Draw an orange debug dot at the zoom center in crop pixel space
-	const cxCropPx = center.x * fullW - cropLeft;
-	const cyCropPx = center.y * fullH - cropTop;
-	drawDot(buffer, cropW, cropH, cxCropPx, cyCropPx, 3);
+	// // Draw an orange debug dot at the zoom center in crop pixel space
+	// const cxCropPx = Math.round(center.x * fullW) - cropLeft;
+	// const cyCropPx = Math.round(center.y * fullH) - cropTop;
+	// let offX2 = 0,
+	// 	offY2 = 0;
+	// if (debugDotOffsetPx > 0) {
+	// 	const dirX = center.x - 0.5;
+	// 	const dirY = center.y - 0.5;
+	// 	const len = Math.hypot(dirX, dirY) || 1;
+	// 	const ux = dirX / len;
+	// 	const uy = dirY / len;
+	// 	const scale = (debugDotOffsetPx * cropW) / outputWidth;
+	// 	offX2 = ux * scale;
+	// 	offY2 = uy * scale;
+	// }
+	// drawDot(buffer, cropW, cropH, cxCropPx + offX2, cyCropPx + offY2, 6);
+	// drawRing(buffer, cropW, cropH, cxCropPx + offX2, cyCropPx + offY2, 10, 3);
+	// // Draw a blue dot at the actual crop center for comparison
+	// drawDot(
+	// 	buffer,
+	// 	cropW,
+	// 	cropH,
+	// 	Math.round(cropW / 2),
+	// 	Math.round(cropH / 2),
+	// 	5,
+	// 	{
+	// 		r: 0,
+	// 		g: 180,
+	// 		b: 255,
+	// 	}
+	// );
 
 	await writeResizedPngAtomic(
 		buffer,
@@ -1093,9 +1206,16 @@ async function main() {
 	// Infinite iterations: each iteration renders zoomSteps frames,
 	// then uses the last frame as the next iteration's source image.
 	const zoomSteps = Math.max(1, Number(config.zoomSteps) || 1);
-	const zoomFactor = Number(config.zoomFactor);
-	let zf = zoomFactor;
-	if (!isFinite(zf) || zf <= 1) zf = 1.1;
+	let zf = Number(config.zoomFactor);
+	if (!isFinite(zf)) {
+		zf = 1.1;
+	} else if (zf <= 0) {
+		// Non-positive factors are invalid; use safe default
+		zf = 1.1;
+	} else if (zf <= 1) {
+		// Treat 0 < zoomFactor <= 1 as a percentage (e.g., 0.08 => 1.08)
+		zf = 1 + zf;
+	}
 
 	const center = { x: 0.5, y: 0.5 };
 	// Track previous and last centers so we can roll back on failures
@@ -1162,29 +1282,34 @@ async function main() {
 				// Advance angle each frame
 				orbitAngle += zoomMotionRadiansPerFrame;
 			}
-			// Keep apparent orbit radius constant in output pixels across zoom
-			// If zoomMotionRadius > 1, treat it as pixels; else as fraction of output width
-			const orbitRadiusNorm =
-				(zoomMotionRadius > 1
+			// Keep orbit radius constant in screen pixels across zoom steps.
+			// Interpret >1 as pixels; else as fraction of output width. Divide by stepScale to compensate zoom.
+			const rawOrbitNorm =
+				zoomMotionRadius > 1
 					? zoomMotionRadius / outputWidth
-					: zoomMotionRadius) / stepScale;
+					: zoomMotionRadius;
+			let orbitRadiusNorm = rawOrbitNorm / stepScale;
+			// Avoid hitting crop bounds: max normalized radius that keeps the crop inside the image
+			const maxNorm = Math.max(0, 0.5 - 0.5 / stepScale);
+			if (orbitRadiusNorm > maxNorm) orbitRadiusNorm = maxNorm;
 			const baseX = 0.5 + orbitRadiusNorm * Math.cos(orbitAngle);
 			const baseY = 0.5 + orbitRadiusNorm * Math.sin(orbitAngle);
 
 			// Add optional small random-walk jitter around the orbital center
+			let jitterDX = 0,
+				jitterDY = 0;
 			if (zoomMotion > 0 && globalFrame > 1) {
-				// Keep jitter amplitude constant in output pixels as well
+				// Keep jitter amplitude constant in screen space by scaling with 1/stepScale
 				const jitterNorm =
 					(zoomMotion > 1 ? zoomMotion / outputWidth : zoomMotion) / stepScale;
-				jitterX += randn() * jitterNorm;
-				jitterY += randn() * jitterNorm;
+				jitterDX = randn() * jitterNorm;
+				jitterDY = randn() * jitterNorm;
 			}
-
 			// Snapshot current center before updating so we can roll back if needed
 			prevCenter = { x: center.x, y: center.y };
 			// Allow full range; cropping logic will clamp within image bounds
-			center.x = clamp(baseX + jitterX, 0, 1);
-			center.y = clamp(baseY + jitterY, 0, 1);
+			center.x = clamp(baseX + jitterDX, 0, 1);
+			center.y = clamp(baseY + jitterDY, 0, 1);
 			lastCenter = { x: center.x, y: center.y };
 			const tileSize = Math.max(1, Math.ceil(Math.pow(zf, step - 1)));
 			const zoomScale = Math.max(1, Math.pow(zf, step - 1));
@@ -1199,6 +1324,9 @@ async function main() {
 				center,
 				zoomScale,
 				colorAdjustStrength,
+				// Draw the orange debug dot slightly offset from the exact center in the orbit direction,
+				// with a constant on-screen radius for visibility.
+				// debugDotOffsetPx: 20,
 			});
 			const secs = Math.round((Date.now() - t0) / 1000);
 			console.log(`[frame ${globalFrame}] done in ${secs}s`);
