@@ -76,9 +76,12 @@ async function computeAvgColor(imgPath) {
 async function readConfig(explicitPath) {
 	// Determine config path in this order:
 	// 1) explicitPath argument
-	// 2) process.argv[2] (CLI argument)
+	// 2) first non-flag CLI argument from process.argv.slice(2)
 	// 3) default to config.json next to this script
-	const argPath = explicitPath || process.argv[2] || null;
+	const cliArgs = process.argv
+		.slice(2)
+		.filter((a) => !(typeof a === 'string' && a.startsWith('-')));
+	const argPath = explicitPath || cliArgs[0] || null;
 
 	// Build candidate paths to try (cwd first, then relative to script dir)
 	const candidates = [];
@@ -750,6 +753,88 @@ async function writeTileCacheBuffer(tilePath, tileSize, buffer) {
 	}
 }
 
+// Rescan tilesDir and add any missing images to tiles.csv (does not remove stale entries)
+async function rescanAndAppendTileCache(tilesDir, cacheName = 'tiles.csv') {
+	const cachePath = path.join(tilesDir, cacheName);
+	// Load existing entries if present
+	let existing = [];
+	try {
+		const csv = await fs.readFile(cachePath, 'utf8');
+		const lines = csv.trim().split(/\r?\n/);
+		for (let i = 1; i < lines.length; i++) {
+			const line = lines[i];
+			const idx1 = line.lastIndexOf(',');
+			const idx2 = line.lastIndexOf(',', idx1 - 1);
+			const idx3 = line.lastIndexOf(',', idx2 - 1);
+			if (idx1 < 0 || idx2 < 0 || idx3 < 0) continue;
+			const p = line.slice(0, idx3);
+			const r = parseInt(line.slice(idx3 + 1, idx2));
+			const g = parseInt(line.slice(idx2 + 1, idx1));
+			const b = parseInt(line.slice(idx1 + 1));
+			if (
+				!Number.isNaN(r) &&
+				!Number.isNaN(g) &&
+				!Number.isNaN(b) &&
+				isImage(p)
+			) {
+				existing.push({ path: p, r, g, b });
+			}
+		}
+		console.log(`[tiles cache] loaded ${existing.length} from ${cachePath}`);
+	} catch (_) {
+		// no existing cache; we'll create from scratch
+	}
+
+	const existingSet = new Set(existing.map((e) => e.path));
+	const newTiles = [];
+	let scanned = 0;
+	console.log(`[tiles] rescanning ${tilesDir} for missing images...`);
+	for await (const img of walkImages(tilesDir)) {
+		if (!existingSet.has(img)) {
+			try {
+				const avg = await computeAvgColor(img);
+				newTiles.push(avg);
+				if (newTiles.length % 100 === 0) {
+					process.stdout.write(`\rnew tiles computed: ${newTiles.length}`);
+				}
+			} catch (_) {
+				// skip unreadable images
+			}
+		}
+		scanned++;
+		if (scanned % 500 === 0) {
+			process.stdout.write(`\rscanned ${scanned} files...`);
+		}
+	}
+	if (newTiles.length) process.stdout.write('\n');
+
+	if (newTiles.length === 0) {
+		console.log('[tiles cache] no missing tiles found; cache up to date');
+		return existing;
+	}
+
+	const all = existing.concat(newTiles);
+	const outLines = [
+		'path,r,g,b',
+		...all.map((t) => `${t.path},${t.r},${t.g},${t.b}`),
+	];
+	try {
+		await safeWriteFileAtomic(
+			cachePath,
+			Buffer.from(outLines.join('\n'), 'utf8'),
+			4
+		);
+		console.log(
+			`[tiles cache] added ${newTiles.length} new entries (total ${all.length}) -> ${cachePath}`
+		);
+	} catch (e) {
+		console.warn(
+			`[tiles cache] failed to update: ${e && e.message ? e.message : e}`
+		);
+	}
+	return all;
+}
+
 async function loadOrBuildTileCache(tilesDir, cacheName = 'tiles.csv') {
 	const cachePath = path.join(tilesDir, cacheName);
 	// Try reading cache
@@ -1186,6 +1271,12 @@ async function main() {
 	// Verify access early
 	await fs.access(sourceImage);
 	await fs.access(tilesDir);
+
+	// Optional rescan: add any missing tiles to tiles.csv if --rescan flag is provided
+	const forceRescan = process.argv.includes('--rescan');
+	if (forceRescan) {
+		await rescanAndAppendTileCache(tilesDir);
+	}
 
 	// Load tiles once and build KD-tree for fast nearest lookups
 	const tiles = await loadOrBuildTileCache(tilesDir);
