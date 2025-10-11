@@ -7,12 +7,12 @@ const path = require('path');
 const sharp = require('sharp');
 const crypto = require('crypto');
 
-// Global error handlers for better diagnostics
+// Global error handlers for better diagnostics (do not exit; keep running)
 process.on('uncaughtException', (err) => {
 	try {
 		console.error('[uncaughtException]', err && err.stack ? err.stack : err);
 	} catch (_) {}
-	process.exit(1);
+	// Intentionally not exiting; continue running.
 });
 process.on('unhandledRejection', (reason) => {
 	try {
@@ -21,7 +21,7 @@ process.on('unhandledRejection', (reason) => {
 			reason && reason.stack ? reason.stack : reason
 		);
 	} catch (_) {}
-	process.exit(1);
+	// Intentionally not exiting; continue running.
 });
 
 // ---- Defaults and basic helpers ----
@@ -142,6 +142,9 @@ function clampByte(v) {
 	// Fast clamp to 0..255 for channel math
 	return v < 0 ? 0 : v > 255 ? 255 : v | 0;
 }
+
+// Track missing tile files we've warned about to avoid log spam
+const _missingTileWarned = new Set();
 
 // ---- Robust atomic write helpers to avoid transient Windows file write errors ----
 async function sleep(ms) {
@@ -421,30 +424,59 @@ async function composeFrameFromPattern({
 
 	// Per-size cache for resized tile buffers
 	const memCache = new Map();
-	async function getTileBuf(p) {
+	function makeSolidTileBuffer(color, size) {
+		const { r, g, b } = color || { r: 0, g: 0, b: 0 };
+		const buf = Buffer.alloc(size * size * 3);
+		for (let i = 0; i < buf.length; i += 3) {
+			buf[i] = clampByte(r);
+			buf[i + 1] = clampByte(g);
+			buf[i + 2] = clampByte(b);
+		}
+		return buf;
+	}
+	async function getTileBuf(tileMeta) {
+		const p = tileMeta.path || tileMeta;
 		const key = `${p}|${tileSize}`;
 		let buf = memCache.get(key);
 		if (buf) return buf;
-		buf = await readTileCacheBuffer(p, tileSize);
-		if (!buf) {
-			buf = await sharp(p)
-				.resize(tileSize, tileSize)
-				.removeAlpha()
-				.toColourspace('srgb')
-				.raw()
-				.toBuffer();
-			const expected = tileSize * tileSize * 3;
-			if (buf.length !== expected) {
+		// Try disk cache first
+		try {
+			buf = await readTileCacheBuffer(p, tileSize);
+			if (!buf) {
+				// Generate from source image
 				buf = await sharp(p)
 					.resize(tileSize, tileSize)
 					.removeAlpha()
 					.toColourspace('srgb')
 					.raw()
 					.toBuffer();
+				const expected = tileSize * tileSize * 3;
+				if (buf.length !== expected) {
+					buf = await sharp(p)
+						.resize(tileSize, tileSize)
+						.removeAlpha()
+						.toColourspace('srgb')
+						.raw()
+						.toBuffer();
+				}
+				if (buf.length === expected) {
+					writeTileCacheBuffer(p, tileSize, buf).catch(() => {});
+				}
 			}
-			if (buf.length === expected) {
-				writeTileCacheBuffer(p, tileSize, buf).catch(() => {});
+		} catch (e) {
+			// Missing or unreadable tile file: warn once and fall back to a solid-color tile
+			if (!_missingTileWarned.has(p)) {
+				_missingTileWarned.add(p);
+				console.warn(
+					`[warn] skipping missing/unreadable tile: ${p} (${
+						e && e.message ? e.message : e
+					})`
+				);
 			}
+			buf = makeSolidTileBuffer(
+				{ r: tileMeta.r || 0, g: tileMeta.g || 0, b: tileMeta.b || 0 },
+				tileSize
+			);
 		}
 		memCache.set(key, buf);
 		return buf;
@@ -466,9 +498,7 @@ async function composeFrameFromPattern({
 	for (let tyIndex = visY0; tyIndex <= visY1; tyIndex++) {
 		const row = pattern[tyIndex];
 		const rowSlice = row.slice(visX0, visX1 + 1);
-		const bufs = await Promise.all(
-			rowSlice.map((t) => getTileBuf(t.path || t))
-		);
+		const bufs = await Promise.all(rowSlice.map((t) => getTileBuf(t)));
 		for (let ix = visX0; ix <= visX1; ix++) {
 			const tile = bufs[ix - visX0];
 			const tMeta = row[ix];

@@ -4,9 +4,9 @@
 	"outputFilename": "museum-paintings",
 	"maxNonuniqueTiles": 4,
 	"randomZoomMotion": 0,
-	"zoomSteps": 52,
-	"zoomFactor": 0.08,
-	"zoomMotionRadius": 400,
+	"zoomSteps": 64,
+	"zoomFactor": 0.06,
+	"zoomMotionRadius": 40,
 	"zoomMotionRadiansPerFrame": 0.04,
 	"colorAdjustStrength": 0.4
 }
